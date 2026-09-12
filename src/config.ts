@@ -16,6 +16,14 @@ const ConfigFileSchema = z
         sessionArgs: z.array(z.string()).default([]),
       })
       .default({}),
+    docker: z
+      .object({
+        baseImage: z.string().default("unused-base"),
+        dockerfileDir: z.string().default("./docker"),
+        // Au-delà de ce nombre de couches, l'image de la tâche est aplatie.
+        flattenAfterLayers: z.number().int().positive().default(30),
+      })
+      .default({}),
     scheduler: z
       .object({
         // Attente globale après un `blocking_limit` (quota saturé).
@@ -51,6 +59,7 @@ export async function loadConfig(file: string = CONFIG_FILE): Promise<Config> {
     rootDir,
     tasksDir: path.resolve(rootDir, cfg.tasksDir),
     dataDir: path.resolve(rootDir, cfg.dataDir),
+    docker: { ...cfg.docker, dockerfileDir: path.resolve(rootDir, cfg.docker.dockerfileDir) },
   };
 }
 

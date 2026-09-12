@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { CONFIG_FILE, loadConfig } from "./config.js";
+import { buildBase } from "./docker.js";
+import { dockerCheck } from "./dockerCheck.js";
 import { describeGraph, loadTasks } from "./task.js";
 
 const program = new Command()
@@ -53,12 +55,24 @@ program
   .description("état des tâches et de la plage en cours")
   .action(notYet(5));
 
-program
-  .command("docker")
-  .description("gérer l'image et les containers")
+const dockerCmd = program.command("docker").description("gérer l'image et les containers");
+
+dockerCmd
+  .command("build")
+  .description("(re)construit l'image de base")
+  .action(async () => {
+    const cfg = await loadConfig(program.opts().config);
+    await buildBase(cfg);
+  });
+
+dockerCmd
   .command("check")
-  .description("construit l'image de base et vérifie le cycle run → commit → run")
-  .action(notYet(2));
+  .description("vérifie le cycle run → commit → run, la rotation et l'aplatissement")
+  .option("--rebuild", "reconstruit l'image de base même si elle existe", false)
+  .action(async (opts: { rebuild: boolean }) => {
+    const cfg = await loadConfig(program.opts().config);
+    await dockerCheck(cfg, opts);
+  });
 
 program.parseAsync().catch((err: Error) => {
   console.error(err.message);

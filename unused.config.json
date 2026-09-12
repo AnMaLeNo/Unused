@@ -3,10 +3,16 @@
   "dataDir": "./data",
   "claude": {
     "sessionArgs": [
-      "--output-format", "json",
+      "--output-format",
+      "json",
       "--no-session-persistence",
       "--dangerously-skip-permissions"
     ]
+  },
+  "docker": {
+    "baseImage": "unused-base",
+    "dockerfileDir": "./docker",
+    "flattenAfterLayers": 30
   },
   "scheduler": {
     "backoffMinutes": 15,
