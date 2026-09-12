@@ -5,6 +5,10 @@ import { formatZodError } from "./config.js";
 
 export const TASK_FILE = "task.json";
 
+// Le nom de la tâche sert de nom d'image Docker (unused-task-<nom>) : minuscules,
+// chiffres, et un seul séparateur . _ - entre deux groupes.
+export const TASK_NAME_RE = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
+
 /**
  * Une tâche = un graphe de nœuds. Chaque nœud lance un skill et désigne son
  * successeur. La seule condition de sortie est le fichier DONE créé par le
@@ -87,6 +91,11 @@ async function exists(p: string): Promise<boolean> {
 
 export async function loadTask(dir: string): Promise<Task> {
   const name = path.basename(dir);
+  if (!TASK_NAME_RE.test(name)) {
+    throw new Error(
+      `nom de tâche invalide "${name}" : minuscules, chiffres, et un seul . _ ou - entre deux groupes (il sert de nom d'image Docker)`,
+    );
+  }
   const file = path.join(dir, TASK_FILE);
   let raw: unknown;
   try {

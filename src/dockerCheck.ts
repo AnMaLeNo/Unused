@@ -16,7 +16,8 @@ import {
   type RunResult,
 } from "./docker.js";
 
-const CHECK_TASK = "_check";
+// Nom valide pour une image Docker, et improbable pour une vraie tâche.
+const CHECK_TASK = "docker-check-internal";
 
 function step(label: string): void {
   console.log(`\n▶ ${label}`);
@@ -109,6 +110,6 @@ export async function dockerCheck(cfg: Config, opts: { rebuild: boolean }): Prom
     await removeTaskImages(CHECK_TASK);
     await docker(["container", "prune", "-f", "--filter", `label=unused.task=${CHECK_TASK}`]);
     await rm(exchangeDir, { recursive: true, force: true });
-    ok("images et containers de _check supprimés");
+    ok(`images et containers de ${CHECK_TASK} supprimés`);
   }
 }

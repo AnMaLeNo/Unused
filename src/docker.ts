@@ -145,7 +145,7 @@ export async function layerCount(image: string): Promise<number> {
  * sous :prev, supprime le container, aplatit si la pile de couches est trop
  * haute, puis nettoie les images orphelines de cette tâche.
  */
-export async function commitTask(cfg: Config, container: string, taskName: string): Promise<void> {
+export async function commitTask(cfg: Config, taskName: string, container: string): Promise<void> {
   const name = taskImage(taskName);
   if (await imageExists(`${name}:latest`)) {
     await mustSucceed(["tag", `${name}:latest`, `${name}:prev`], "rotation de l'image");
