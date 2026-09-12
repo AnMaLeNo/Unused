@@ -30,6 +30,8 @@ const ConfigFileSchema = z
       .object({
         // Attente globale après un `blocking_limit` (quota saturé).
         backoffMinutes: z.number().int().positive().default(15),
+        // Pause après un échec (hors quota) avant de rejouer le même nœud.
+        retrySeconds: z.number().nonnegative().default(60),
         // Échecs consécutifs (hors quota) avant de sortir une tâche de la file.
         maxConsecutiveFailures: z.number().int().positive().default(3),
       })

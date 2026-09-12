@@ -17,6 +17,7 @@
   },
   "scheduler": {
     "backoffMinutes": 15,
+    "retrySeconds": 60,
     "maxConsecutiveFailures": 3
   }
 }

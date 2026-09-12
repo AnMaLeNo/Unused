@@ -14,6 +14,8 @@ export const DONE_FILE = "DONE";
 export interface IterateOptions {
   dryRun?: boolean;
   print?: (line: string) => void;
+  // Arrêt demandé : le container est tué, l'itération est jetée sans toucher à l'état.
+  signal?: AbortSignal;
 }
 
 export interface IterateResult {
@@ -21,6 +23,7 @@ export interface IterateResult {
   outcome: Outcome;
   decision: Decision;
   logFile: string | null;
+  costUsd?: number;
 }
 
 async function exists(p: string): Promise<boolean> {
@@ -77,7 +80,9 @@ export async function iterate(
   print(`départ   ${startedAt.toISOString()}`);
 
   let timedOut = false;
+  let aborted = false;
   let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
   const run = runInTask(cfg, task.name, {
     cmd: command,
     stdin: prompt,
@@ -90,16 +95,32 @@ export async function iterate(
         timedOut = true;
         void docker(["kill", container]);
       }, cfg.claude.timeoutMinutes * 60_000);
+      onAbort = () => {
+        aborted = true;
+        void docker(["kill", container]);
+      };
+      if (opts.signal?.aborted) onAbort();
+      else opts.signal?.addEventListener("abort", onAbort);
     },
   });
-  const r = await run.finally(() => clearTimeout(timer));
+  const r = await run.finally(() => {
+    clearTimeout(timer);
+    if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
+  });
   const endedAt = new Date();
 
   const result = parseResult(r.stdout);
   const done = await exists(donePath);
-  const outcome = timedOut ? ({ kind: "failure", reason: "timeout" } as const) : classify(result?.terminal_reason, done);
-  const decision = applyOutcome(task, ts, outcome, { maxConsecutiveFailures: cfg.scheduler.maxConsecutiveFailures });
-  applyDecision(state, task, decision);
+  const outcome: Outcome = aborted
+    ? { kind: "failure", reason: "aborted" }
+    : timedOut
+      ? { kind: "failure", reason: "timeout" }
+      : classify(result?.terminal_reason, done);
+  // Un arrêt demandé ne compte ni comme échec ni comme quoi que ce soit.
+  const decision: Decision = aborted
+    ? "retry"
+    : applyOutcome(task, ts, outcome, { maxConsecutiveFailures: cfg.scheduler.maxConsecutiveFailures });
+  if (!aborted) applyDecision(state, task, decision);
 
   let committed = false;
   if (outcome.kind === "completed") {
@@ -109,7 +130,7 @@ export async function iterate(
     await discardContainer(r.container);
     await rm(donePath, { force: true });
   }
-  await saveState(cfg.dataDir, state);
+  if (!aborted) await saveState(cfg.dataDir, state);
 
   const rec: IterationRecord = {
     task: task.name,
@@ -138,8 +159,8 @@ export async function iterate(
   print(`fin      ${endedAt.toISOString()} (${Math.round(rec.durationMs / 1000)}s, code ${r.code})`);
   print(`issue    ${label}${done ? " + DONE" : ""} → ${decision}${committed ? " (commit)" : " (jeté)"}`);
   if (result?.total_cost_usd !== undefined) print(`coût     $${result.total_cost_usd.toFixed(4)}, ${result.num_turns ?? "?"} tours`);
-  if (result === null) print(`stderr   ${r.stderr.trim().split("\n").slice(-3).join("\n         ")}`);
+  if (result === null && r.stderr.trim()) print(`stderr   ${r.stderr.trim().split("\n").slice(-3).join("\n         ")}`);
   print(`curseur  ${ts.cursor}`);
   print(`log      ${logFile}`);
-  return { node: nodeName, outcome, decision, logFile };
+  return { node: nodeName, outcome, decision, logFile, costUsd: result?.total_cost_usd };
 }
