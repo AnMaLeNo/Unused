@@ -7,7 +7,8 @@
       "json",
       "--no-session-persistence",
       "--dangerously-skip-permissions"
-    ]
+    ],
+    "timeoutMinutes": 180
   },
   "docker": {
     "baseImage": "unused-base",

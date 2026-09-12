@@ -14,6 +14,8 @@ const ConfigFileSchema = z
         // Le runner s'assure par ailleurs que `--output-format json` y figure,
         // il en a besoin pour lire `terminal_reason`.
         sessionArgs: z.array(z.string()).default([]),
+        // Au-delà, la session est tuée et l'itération comptée en échec.
+        timeoutMinutes: z.number().positive().default(180),
       })
       .default({}),
     docker: z

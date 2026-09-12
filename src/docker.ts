@@ -100,6 +100,10 @@ export interface RunOptions {
   // processus docker (`-e NOM` sans valeur), pas par la ligne de commande,
   // pour qu'un token n'apparaisse jamais dans `ps`.
   env?: Record<string, string>;
+  // Montages supplémentaires (ex. les skills, en lecture seule).
+  mounts?: { host: string; container: string; readonly?: boolean }[];
+  // Appelé avec le nom du container juste avant son lancement.
+  onStart?: (container: string) => void;
 }
 
 export interface RunResult extends ExecResult {
@@ -124,9 +128,11 @@ export async function runInTask(cfg: Config, taskName: string, opts: RunOptions)
     "-v",
     `${opts.exchangeDir}:/exchange`,
   ];
+  for (const m of opts.mounts ?? []) args.push("-v", `${m.host}:${m.container}${m.readonly ? ":ro" : ""}`);
   if (opts.stdin !== undefined) args.push("-i");
   for (const name of Object.keys(opts.env ?? {})) args.push("-e", name);
   args.push(image, ...opts.cmd);
+  opts.onStart?.(container);
   const r = await docker(args, { stdin: opts.stdin, env: opts.env });
   return { ...r, container, image };
 }
