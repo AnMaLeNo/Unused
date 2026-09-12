@@ -1,0 +1,11 @@
+{
+  "active": true,
+  "start": "find-next",
+  "params": {
+    "repo": "https://github.com/exemple/projet"
+  },
+  "nodes": {
+    "find-next": { "skill": "find-next", "next": "do-work" },
+    "do-work":   { "skill": "do-work",   "next": "find-next" }
+  }
+}

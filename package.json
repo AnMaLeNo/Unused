@@ -1,0 +1,27 @@
+{
+  "name": "unused",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Consomme le quota inutilisé d'un abonnement Claude Code en faisant tourner des tâches infinies dans des containers.",
+  "type": "module",
+  "bin": {
+    "unused": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

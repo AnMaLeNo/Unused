@@ -1,0 +1,15 @@
+{
+  "tasksDir": "./tasks",
+  "dataDir": "./data",
+  "claude": {
+    "sessionArgs": [
+      "--output-format", "json",
+      "--no-session-persistence",
+      "--dangerously-skip-permissions"
+    ]
+  },
+  "scheduler": {
+    "backoffMinutes": 15,
+    "maxConsecutiveFailures": 3
+  }
+}
