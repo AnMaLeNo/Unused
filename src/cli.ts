@@ -2,15 +2,11 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
+import { createApi, listen, socketPath } from "./api.js";
+import { ApiError, call, DaemonUnreachable, stream } from "./client.js";
 import { CONFIG_FILE, loadConfig, type Config } from "./config.js";
-import { rm } from "node:fs/promises";
-import { buildBase, removeTaskImages } from "./docker.js";
-import { formatDuration, parseDuration } from "./duration.js";
-import { runWindow } from "./scheduler.js";
-import { dockerCheck } from "./dockerCheck.js";
-import { DONE_FILE, iterate } from "./iterate.js";
-import { loadState, saveState } from "./state.js";
-import { describeGraph, loadTasks } from "./task.js";
+import { Daemon, type DaemonStatus } from "./daemon.js";
+import { formatDuration } from "./duration.js";
 
 const program = new Command()
   .name("unused")
@@ -25,142 +21,145 @@ async function setup(): Promise<Config> {
   return cfg;
 }
 
-function notYet(step: number): () => never {
-  return () => {
-    console.error(`pas encore implémenté (étape ${step})`);
-    process.exit(2);
-  };
-}
+// ---------------------------------------------------------------- le démon
 
-const tasks = program.command("tasks").description("gérer les tâches");
-
-tasks
-  .command("list")
-  .description("liste les tâches et signale celles qui sont mal définies")
+program
+  .command("daemon")
+  .description("le processus qui vit : exécute les plages, sert l'API sur data/unused.sock (lancé par systemd)")
   .action(async () => {
     const cfg = await setup();
-    const { tasks, errors } = await loadTasks(cfg.tasksDir);
-    if (tasks.length === 0 && errors.length === 0) {
-      console.log(`aucune tâche dans ${cfg.tasksDir}`);
+    const log = (line: string): void => console.log(line);
+    const daemon = new Daemon(cfg, { print: log });
+    await daemon.init();
+    const server = createApi(cfg, daemon);
+    const sock = socketPath(cfg);
+    await listen(server, sock);
+    log(`démon prêt, socket ${sock}`);
+
+    const ac = new AbortController();
+    let signals = 0;
+    const onSignal = (sig: string): void => {
+      signals += 1;
+      if (signals > 1) process.exit(130);
+      log(`${sig} reçu : arrêt (l'itération en cours est jetée, la plage sera reprise au prochain démarrage)`);
+      ac.abort();
+    };
+    process.on("SIGINT", () => onSignal("SIGINT"));
+    process.on("SIGTERM", () => onSignal("SIGTERM"));
+    try {
+      await daemon.run(ac.signal);
+    } finally {
+      server.close();
+      log("démon arrêté");
     }
-    for (const t of tasks) {
-      const flag = t.def.active ? "active  " : "inactive";
-      console.log(`${flag}  ${t.name}`);
-      console.log(`          ${describeGraph(t.def)}`);
-    }
-    for (const e of errors) {
-      console.error(`\nERREUR   ${e.name}\n          ${e.message.replace(/\n/g, "\n          ")}`);
-    }
-    if (errors.length > 0) process.exitCode = 1;
+  });
+
+// ------------------------------------------------------- la CLI, cliente
+
+async function sock(): Promise<string> {
+  return socketPath(await setup());
+}
+
+program
+  .command("start")
+  .description("démarre une plage : les tâches actives tournent jusqu'à son terme")
+  .requiredOption("--for <duration>", "durée, ex. 8h, 90m, 1d12h")
+  .action(async (opts: { for: string }) => {
+    const r = await call<{ until: string }>(await sock(), "POST", "/window", { for: opts.for });
+    console.log(`plage démarrée jusqu'à ${r.until}`);
   });
 
 program
-  .command("iterate <task>")
-  .description("exécute une seule itération d'une tâche (nœud courant)")
-  .option("--dry-run", "affiche le prompt et la commande sans rien lancer", false)
-  .action(async (name: string, opts: { dryRun: boolean }) => {
-    const cfg = await setup();
-    const { tasks, errors } = await loadTasks(cfg.tasksDir);
-    const task = tasks.find((t) => t.name === name);
-    if (!task) {
-      const bad = errors.find((e) => e.name === name);
-      throw new Error(bad ? `tâche ${name} invalide : ${bad.message}` : `tâche ${name} introuvable dans ${cfg.tasksDir}`);
+  .command("stop")
+  .description("arrête la plage en cours après l'itération en cours (--now : tout de suite, itération jetée)")
+  .option("--now", "tue l'itération en cours", false)
+  .action(async (opts: { now: boolean }) => {
+    const r = await call<{ stopping: string }>(await sock(), "DELETE", `/window${opts.now ? "?now=1" : ""}`);
+    console.log(r.stopping === "now" ? "plage arrêtée" : "arrêt demandé : la plage s'arrêtera après l'itération en cours");
+  });
+
+program
+  .command("status")
+  .description("état du démon, de la plage en cours et des tâches")
+  .option("--json", "sortie JSON brute", false)
+  .action(async (opts: { json: boolean }) => {
+    const s = await call<DaemonStatus>(await sock(), "GET", "/status");
+    if (opts.json) return console.log(JSON.stringify(s, null, 2));
+    console.log(`démon    pid ${s.daemon.pid}, démarré ${s.daemon.startedAt}`);
+    const w = s.window;
+    if (!w) {
+      console.log("plage    aucune");
+    } else {
+      console.log(`plage    jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
+      console.log(`         ${w.iterations} itérations, ${w.completed} completed, ${w.failures} échecs, ${w.backoffs} attentes quota, $${w.costUsd.toFixed(2)}`);
+      if (w.current) console.log(`en cours ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
+      else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil}`);
     }
-    const state = await loadState(cfg.dataDir);
-    await iterate(cfg, task, state, { dryRun: opts.dryRun, print: console.log });
+    if (s.lastWindow && !w) {
+      const l = s.lastWindow;
+      console.log(`dernière ${l.iterations} itérations, ${l.completed} completed, ${l.failures} échecs, $${l.costUsd.toFixed(2)} (${l.endedBecause})`);
+    }
+    printTasks(s.tasks, s.taskErrors);
+  });
+
+const tasks = program.command("tasks").description("gérer les tâches");
+
+function printTasks(list: DaemonStatus["tasks"], errors: DaemonStatus["taskErrors"]): void {
+  console.log(list.length === 0 && errors.length === 0 ? "tâches   aucune" : "tâches");
+  for (const t of list) {
+    const flag = !t.active ? "inactive" : t.status === "running" ? "active  " : t.status === "done" ? "done    " : "failed  ";
+    const last = t.last ? `, dernier ${t.last.node} → ${t.last.outcome} (${t.last.at})` : "";
+    console.log(`  ${flag}  ${t.name}  curseur ${t.cursor}, ${t.iterations} itérations${last}`);
+  }
+  for (const e of errors) console.log(`  ERREUR    ${e.name}  ${e.message.replace(/\n/g, "\n            ")}`);
+}
+
+tasks
+  .command("list")
+  .description("liste les tâches, leur curseur et leur statut")
+  .action(async () => {
+    const r = await call<{ tasks: DaemonStatus["tasks"]; errors: DaemonStatus["taskErrors"] }>(await sock(), "GET", "/tasks");
+    printTasks(r.tasks, r.errors);
+    if (r.errors.length > 0) process.exitCode = 1;
   });
 
 tasks
   .command("reset <task>")
   .description("remet une tâche à zéro : état, image Docker, DONE (les autres fichiers d'exchange sont gardés)")
   .action(async (name: string) => {
-    const cfg = await setup();
-    const { tasks } = await loadTasks(cfg.tasksDir);
-    const task = tasks.find((t) => t.name === name);
-    if (!task) throw new Error(`tâche ${name} introuvable dans ${cfg.tasksDir}`);
-    const state = await loadState(cfg.dataDir);
-    delete state.tasks[name];
-    if (state.currentTask === name) state.currentTask = null;
-    await saveState(cfg.dataDir, state);
-    await rm(path.join(task.exchangeDir, DONE_FILE), { force: true });
-    await removeTaskImages(name);
-    console.log(`${name} remise à zéro (curseur sur ${task.def.start}, image supprimée)`);
+    const r = await call<{ start: string }>(await sock(), "POST", `/tasks/${encodeURIComponent(name)}/reset`);
+    console.log(`${name} remise à zéro (curseur sur ${r.start}, image supprimée)`);
   });
 
-program
-  .command("run")
-  .description("fait tourner les tâches actives pendant une plage de temps")
-  .option("--for <duration>", "durée de la plage à partir de maintenant, ex. 8h, 90m, 1d12h")
-  .option("--resume", "reprend la plage enregistrée (après un redémarrage)", false)
-  .action(async (opts: { for?: string; resume: boolean }) => {
-    const cfg = await setup();
-    const state = await loadState(cfg.dataDir);
-    let until: Date;
-    if (opts.for) {
-      until = new Date(Date.now() + parseDuration(opts.for));
-    } else if (opts.resume) {
-      if (!state.window) {
-        console.log("aucune plage enregistrée, rien à reprendre");
-        return;
-      }
-      until = new Date(state.window.until);
-      if (until.getTime() <= Date.now()) {
-        console.log(`la plage enregistrée est terminée depuis ${formatDuration(Date.now() - until.getTime())}`);
-        state.window = null;
-        await saveState(cfg.dataDir, state);
-        return;
-      }
-      console.log(`reprise de la plage commencée le ${state.window.startedAt}`);
-    } else {
-      throw new Error("indique --for <durée> ou --resume");
-    }
+for (const [cmd, active] of [
+  ["activate", true],
+  ["deactivate", false],
+] as const) {
+  tasks
+    .command(`${cmd} <task>`)
+    .description(active ? "remet une tâche dans la file" : "retire une tâche de la file (task.json : active=false)")
+    .action(async (name: string) => {
+      await call(await sock(), "POST", `/tasks/${encodeURIComponent(name)}/active`, { active });
+      console.log(`${name} ${active ? "activée" : "désactivée"}`);
+    });
+}
 
-    const { tasks, errors } = await loadTasks(cfg.tasksDir);
-    for (const e of errors) console.error(`tâche ${e.name} ignorée : ${e.message}`);
-
-    const ac = new AbortController();
-    let signals = 0;
-    const onSignal = (): void => {
-      signals += 1;
-      if (signals > 1) process.exit(130);
-      console.log("\narrêt demandé : l'itération en cours est jetée (Ctrl-C à nouveau pour forcer)");
-      ac.abort();
-    };
-    process.on("SIGINT", onSignal);
-    process.on("SIGTERM", onSignal);
-    try {
-      await runWindow(cfg, tasks, state, until, ac.signal, { print: console.log });
-    } finally {
-      process.off("SIGINT", onSignal);
-      process.off("SIGTERM", onSignal);
-    }
-  });
-
-program
-  .command("status")
-  .description("état des tâches et de la plage en cours")
-  .action(notYet(5));
-
-const dockerCmd = program.command("docker").description("gérer l'image et les containers");
+const dockerCmd = program.command("docker").description("gérer l'image de base");
 
 dockerCmd
   .command("build")
   .description("(re)construit l'image de base")
-  .action(async () => {
-    const cfg = await setup();
-    await buildBase(cfg);
-  });
+  .action(async () => stream(await sock(), "POST", "/docker/build", console.log));
 
 dockerCmd
   .command("check")
   .description("vérifie le cycle run → commit → run, la rotation et l'aplatissement")
   .option("--rebuild", "reconstruit l'image de base même si elle existe", false)
-  .action(async (opts: { rebuild: boolean }) => {
-    const cfg = await setup();
-    await dockerCheck(cfg, opts);
-  });
+  .action(async (opts: { rebuild: boolean }) =>
+    stream(await sock(), "POST", `/docker/check${opts.rebuild ? "?rebuild=1" : ""}`, console.log),
+  );
 
 program.parseAsync().catch((err: Error) => {
-  console.error(err.message);
-  process.exit(1);
+  console.error(err instanceof DaemonUnreachable || err instanceof ApiError ? err.message : err.message);
+  process.exit(err instanceof ApiError && err.status === 409 ? 3 : 1);
 });

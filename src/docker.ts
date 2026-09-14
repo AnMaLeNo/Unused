@@ -20,22 +20,27 @@ export class DockerError extends Error {
 interface DockerOpts {
   stdin?: string;
   env?: Record<string, string>;
-  // "inherit" affiche la sortie en direct (build) ; "pipe" la capture.
-  stdio?: "pipe" | "inherit";
+  // Reçoit stdout et stderr au fil de l'eau (build), en plus de la capture.
+  onOutput?: (chunk: string) => void;
 }
 
 /** Lance `docker <args>`. Ne lève pas sur code ≠ 0 : c'est l'appelant qui décide. */
 export function docker(args: string[], opts: DockerOpts = {}): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    const inherit = opts.stdio === "inherit";
     const child = spawn("docker", args, {
       env: { ...process.env, ...opts.env },
-      stdio: [opts.stdin === undefined ? "ignore" : "pipe", inherit ? "inherit" : "pipe", inherit ? "inherit" : "pipe"],
+      stdio: [opts.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
-    child.stdout?.on("data", (d: Buffer) => out.push(d));
-    child.stderr?.on("data", (d: Buffer) => err.push(d));
+    child.stdout?.on("data", (d: Buffer) => {
+      out.push(d);
+      opts.onOutput?.(d.toString("utf8"));
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      err.push(d);
+      opts.onOutput?.(d.toString("utf8"));
+    });
     child.on("error", (e: NodeJS.ErrnoException) => {
       reject(
         new DockerError(
@@ -74,10 +79,17 @@ export async function imageExists(image: string): Promise<boolean> {
   return (await docker(["image", "inspect", image])).code === 0;
 }
 
-export async function buildBase(cfg: Config): Promise<void> {
+export async function buildBase(cfg: Config, print: (line: string) => void): Promise<void> {
+  let buf = "";
   await mustSucceed(["build", "-t", cfg.docker.baseImage, cfg.docker.dockerfileDir], "build de l'image de base", {
-    stdio: "inherit",
+    onOutput: (chunk) => {
+      buf += chunk;
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const l of lines) print(l);
+    },
   });
+  if (buf) print(buf);
 }
 
 export const LABEL = "unused.task";

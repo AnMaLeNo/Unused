@@ -19,12 +19,7 @@ import {
 // Nom valide pour une image Docker, et improbable pour une vraie tâche.
 const CHECK_TASK = "docker-check-internal";
 
-function step(label: string): void {
-  console.log(`\n▶ ${label}`);
-}
-function ok(msg: string): void {
-  console.log(`  ✔ ${msg}`);
-}
+type Print = (line: string) => void;
 
 function expectOutput(r: RunResult, expected: string, what: string): void {
   if (r.code !== 0 || r.stdout.trim() !== expected) {
@@ -38,14 +33,16 @@ function expectOutput(r: RunResult, expected: string, what: string): void {
  * Vérifie de bout en bout la mécanique Docker sans Claude ni quota :
  * image de base, cycle run → commit → run, rotation :prev, aplatissement.
  */
-export async function dockerCheck(cfg: Config, opts: { rebuild: boolean }): Promise<void> {
+export async function dockerCheck(cfg: Config, opts: { rebuild: boolean }, print: Print): Promise<void> {
+  const step = (label: string): void => print(`\n▶ ${label}`);
+  const ok = (msg: string): void => print(`  ✔ ${msg}`);
   step("Docker");
   ok(`docker ${await dockerVersion()}`);
 
   step(`Image de base ${cfg.docker.baseImage}`);
   if (opts.rebuild || !(await imageExists(cfg.docker.baseImage))) {
-    console.log(`  build depuis ${cfg.docker.dockerfileDir}…`);
-    await buildBase(cfg);
+    print(`  build depuis ${cfg.docker.dockerfileDir}…`);
+    await buildBase(cfg, (l) => print(`    ${l}`));
   }
   ok(`image présente (${await layerCount(cfg.docker.baseImage)} couches)`);
 
@@ -104,7 +101,7 @@ export async function dockerCheck(cfg: Config, opts: { rebuild: boolean }): Prom
     expectOutput(r4, "persisted\n1\n/work\nclaude-ok", "état et config après aplatissement");
     ok(`${before} → ${after} couche, ENV/WORKDIR/PATH conservés`);
 
-    console.log("\nTout est en ordre.");
+    print("\nTout est en ordre.");
   } finally {
     step("Nettoyage");
     await removeTaskImages(CHECK_TASK);

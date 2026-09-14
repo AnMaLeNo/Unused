@@ -1,0 +1,26 @@
+# Unité systemd pour le démon unused, sur le Pi.
+#   sudo cp deploy/unused.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now unused
+# Adapter User, WorkingDirectory et le chemin de node si besoin.
+[Unit]
+Description=unused — tâches infinies sur le quota Claude Code inutilisé
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=unused
+Group=docker
+WorkingDirectory=/opt/unused
+EnvironmentFile=/opt/unused/.env
+ExecStart=/usr/bin/node /opt/unused/dist/cli.js daemon
+Restart=always
+RestartSec=5
+# SIGTERM n'est envoyé qu'au démon, qui tue lui-même le container en cours ;
+# le reste du cgroup n'est frappé qu'après TimeoutStopSec.
+KillMode=mixed
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
