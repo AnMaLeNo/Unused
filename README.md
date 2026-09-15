@@ -89,6 +89,10 @@ unused stop                  # après l'itération en cours ; --now pour tuer
 unused tasks list | reset <t> | activate <t> | deactivate <t>
 ```
 
+La CLI trouve le démon par `--socket`, sinon `$UNUSED_SOCKET`, sinon
+`<dataDir>/unused.sock` déduit de `unused.config.json`. Elle ne lit jamais
+`.env` : le token ne sert qu'au démon.
+
 Le démon reprend une plage interrompue par un redémarrage. Les logs de chaque
 itération (le JSON complet rendu par Claude) sont dans `data/logs/<tâche>/`,
 avec un index dans `data/logs/index.jsonl`.

@@ -11,14 +11,23 @@ import { formatDuration } from "./duration.js";
 const program = new Command()
   .name("unused")
   .description("Fait tourner des tâches infinies sur le quota inutilisé d'un abonnement Claude Code.")
-  .option("-c, --config <file>", "fichier de configuration", CONFIG_FILE);
+  .option("-c, --config <file>", "fichier de configuration (démon, ou pour déduire le socket)", CONFIG_FILE)
+  .option("-s, --socket <path>", "socket du démon (défaut : $UNUSED_SOCKET, sinon <dataDir>/unused.sock)");
 
-/** Charge la config, puis un éventuel .env à côté (token, etc.) sans écraser l'environnement. */
-async function setup(): Promise<Config> {
+/** Démon uniquement : la config, puis un éventuel .env à côté (token) sans écraser l'environnement. */
+async function daemonSetup(): Promise<Config> {
   const cfg = await loadConfig(program.opts().config);
   const envFile = path.join(cfg.rootDir, ".env");
   if (existsSync(envFile)) process.loadEnvFile(envFile);
   return cfg;
+}
+
+/** Client : où est le démon ? Flag, variable d'environnement, sinon déduit de la config. Jamais .env. */
+async function sock(): Promise<string> {
+  const opts = program.opts<{ socket?: string; config: string }>();
+  if (opts.socket) return path.resolve(opts.socket);
+  if (process.env.UNUSED_SOCKET) return path.resolve(process.env.UNUSED_SOCKET);
+  return socketPath(await loadConfig(opts.config));
 }
 
 // ---------------------------------------------------------------- le démon
@@ -27,7 +36,7 @@ program
   .command("daemon")
   .description("le processus qui vit : exécute les plages, sert l'API sur data/unused.sock (lancé par systemd)")
   .action(async () => {
-    const cfg = await setup();
+    const cfg = await daemonSetup();
     const log = (line: string): void => console.log(line);
     const daemon = new Daemon(cfg, { print: log });
     await daemon.init();
@@ -55,10 +64,6 @@ program
   });
 
 // ------------------------------------------------------- la CLI, cliente
-
-async function sock(): Promise<string> {
-  return socketPath(await setup());
-}
 
 program
   .command("start")
