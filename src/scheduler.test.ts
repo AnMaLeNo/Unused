@@ -42,6 +42,7 @@ function fakeIteration(
   script: (task: Task, n: number) => Decision,
   ck: ReturnType<typeof clock>,
   log: string[],
+  resetsAt: (n: number) => number | undefined = () => undefined,
 ) {
   let n = 0;
   return async (task: Task, state: RunnerState): Promise<IterateResult> => {
@@ -51,19 +52,20 @@ function fakeIteration(
     log.push(`${task.name}:${decision}`);
     if (decision === "task-done") ts.status = "done";
     if (decision === "task-failed") ts.status = "failed";
-    if (decision === "backoff" || decision === "retry") state.currentTask = task.name;
+    if (decision === "backoff" || decision === "retry" || decision === "stop-window") state.currentTask = task.name;
     else {
       state.currentTask = null;
       state.lastTask = task.name;
     }
-    const kind = decision === "next-task" || decision === "task-done" ? "completed" : decision === "backoff" ? "quota" : "failure";
-    return {
-      node: "a",
-      outcome: kind === "completed" ? { kind, done: decision === "task-done" } : { kind, reason: "x" },
-      decision,
-      logFile: null,
-      costUsd: 0.5,
-    };
+    const outcome: IterateResult["outcome"] =
+      decision === "next-task" || decision === "task-done"
+        ? { kind: "completed", done: decision === "task-done" }
+        : decision === "backoff"
+          ? { kind: "quota", reason: "five_hour", resetsAt: resetsAt(n - 1) }
+          : decision === "stop-window"
+            ? { kind: "fatal", reason: "auth", detail: "401" }
+            : { kind: "failure", reason: "x" };
+    return { node: "a", outcome, decision, logFile: null, costUsd: 0.5 };
   };
 }
 
@@ -85,6 +87,52 @@ describe("runWindow", () => {
     expect(s).toMatchObject({ iterations: 4, completed: 4, endedBecause: "window", costUsd: 2 });
     expect(state.window).toBeNull();
     expect((await loadState(dataDir)).window).toBeNull();
+  });
+
+  it("quota avec reset annoncé : dort jusqu'au reset (+30 s), pas 15 min", async () => {
+    const ck = clock(T0, MIN);
+    const log: string[] = [];
+    const events: string[] = [];
+    const reset = Math.floor((T0 + 8 * MIN) / 1000);
+    await runWindow(cfg, [makeTask("a")], emptyState(), new Date(T0 + 60 * MIN), new AbortController().signal, {
+      now: ck.now,
+      sleep: ck.sleep,
+      runIteration: fakeIteration((_t, n) => (n === 0 ? "backoff" : "task-done"), ck, log, () => reset),
+      onEvent: (e) => e.type === "backoff" && events.push(e.until),
+    });
+    // itération 1 finit à T0+1min ; reset à T0+8min ; reprise à T0+8min30.
+    expect(events).toEqual([new Date(T0 + 8 * MIN + 30_000).toISOString()]);
+    expect(log).toEqual(["a:backoff", "a:task-done"]);
+  });
+
+  it("panne globale : la plage s'arrête, reste enregistrée, la tâche reste collante", async () => {
+    const ck = clock(T0, MIN);
+    const log: string[] = [];
+    const state = emptyState();
+    const s = await runWindow(cfg, [makeTask("a"), makeTask("b")], state, new Date(T0 + 60 * MIN), new AbortController().signal, {
+      now: ck.now,
+      sleep: ck.sleep,
+      runIteration: fakeIteration((_t, n) => (n === 0 ? "next-task" : "stop-window"), ck, log),
+    });
+    expect(log).toEqual(["a:next-task", "b:stop-window"]);
+    expect(s).toMatchObject({ endedBecause: "fatal", fatal: { reason: "auth" } });
+    expect(state.window).not.toBeNull();
+  });
+
+  it("la fin de plage est réévaluée à chaque tour (prolongation)", async () => {
+    const ck = clock(T0, 10 * MIN);
+    const log: string[] = [];
+    let until = T0 + 15 * MIN;
+    const s = await runWindow(cfg, [makeTask("a")], emptyState(), () => new Date(until), new AbortController().signal, {
+      now: ck.now,
+      sleep: ck.sleep,
+      runIteration: async (t, st) => {
+        const r = await fakeIteration(() => "next-task", ck, log)(t, st);
+        if (log.length === 1) until = T0 + 45 * MIN; // une plage automatique s'ouvre
+        return r;
+      },
+    });
+    expect(s.iterations).toBe(5);
   });
 
   it("quota : attente globale puis même tâche", async () => {

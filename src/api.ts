@@ -65,7 +65,7 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
       }
 
       if (route === "DELETE /window") {
-        return sendJson(res, 200, daemon.stopWindow(url.searchParams.get("now") === "1"));
+        return sendJson(res, 200, await daemon.stopWindow(url.searchParams.get("now") === "1"));
       }
 
       if (route === "GET /tasks") {

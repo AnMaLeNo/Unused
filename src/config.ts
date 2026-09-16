@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { WindowSpecSchema } from "./calendar.js";
 
 export const CONFIG_FILE = "unused.config.json";
 
@@ -26,6 +27,9 @@ const ConfigFileSchema = z
         flattenAfterLayers: z.number().int().positive().default(30),
       })
       .default({}),
+    // Plages automatiques (heure locale de la machine) : le démon travaille dès
+    // qu'une plage, manuelle ou automatique, le dit. Elles se cumulent.
+    windows: z.array(WindowSpecSchema).default([]),
     scheduler: z
       .object({
         // Attente globale après un `blocking_limit` (quota saturé).

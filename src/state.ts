@@ -27,6 +27,8 @@ const RunnerStateSchema = z.object({
   currentTask: z.string().nullable(),
   // Dernière tâche à avoir rendu la main proprement ; point de départ du round-robin.
   lastTask: z.string().nullable(),
+  // Après un `stop`, les plages automatiques sont ignorées jusqu'à cet instant.
+  pausedUntil: z.string().nullable().default(null),
   tasks: z.record(TaskStateSchema),
 });
 
@@ -34,7 +36,7 @@ export type TaskState = z.infer<typeof TaskStateSchema>;
 export type RunnerState = z.infer<typeof RunnerStateSchema>;
 
 export function emptyState(): RunnerState {
-  return { version: 1, window: null, currentTask: null, lastTask: null, tasks: {} };
+  return { version: 1, window: null, currentTask: null, lastTask: null, pausedUntil: null, tasks: {} };
 }
 
 export function initialTaskState(task: Task): TaskState {

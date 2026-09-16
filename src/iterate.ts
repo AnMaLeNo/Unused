@@ -1,8 +1,8 @@
 import { rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { buildCommand, buildPrompt, parseResult } from "./claude.js";
+import { buildCommand, buildPrompt, parseStream, quotaSnapshot, type QuotaSnapshot } from "./claude.js";
 import type { Config } from "./config.js";
-import { commitTask, discardContainer, docker, runInTask } from "./docker.js";
+import { commitTask, discardContainer, docker, DockerError, runInTask } from "./docker.js";
 import { applyDecision, applyOutcome, classify, type Decision, type Outcome } from "./graph.js";
 import { writeIterationLog, type IterationRecord } from "./log.js";
 import { ensureTaskState, saveState, type RunnerState } from "./state.js";
@@ -24,6 +24,7 @@ export interface IterateResult {
   decision: Decision;
   logFile: string | null;
   costUsd?: number;
+  quotaAfter?: QuotaSnapshot | null;
 }
 
 async function exists(p: string): Promise<boolean> {
@@ -33,6 +34,13 @@ async function exists(p: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+const DOCKER_DOWN = /Cannot connect to the Docker daemon|docker daemon is not running|error during connect|permission denied while trying to connect to the Docker daemon/i;
+
+/** Le démon Docker est-il injoignable, d'après ce que `docker run` a dit ? */
+export function isDockerDown(stderr: string): boolean {
+  return DOCKER_DOWN.test(stderr);
 }
 
 /**
@@ -69,7 +77,7 @@ export async function iterate(
 
   const token = process.env[TOKEN_ENV];
   if (!token) {
-    throw new Error(`${TOKEN_ENV} absent : lance \`claude setup-token\` et mets le token dans .env ou l'environnement`);
+    return finishFatal("auth", `${TOKEN_ENV} absent : lance \`claude setup-token\` et mets le token dans .env`);
   }
 
   // Un DONE qui traîne d'une itération précédente ne doit pas être pris pour
@@ -83,39 +91,48 @@ export async function iterate(
   let aborted = false;
   let timer: NodeJS.Timeout | undefined;
   let onAbort: (() => void) | undefined;
-  const run = runInTask(cfg, task.name, {
-    cmd: command,
-    stdin: prompt,
-    exchangeDir: task.exchangeDir,
-    env: { [TOKEN_ENV]: token },
-    // Les skills du graphe, lus depuis l'hôte : jamais copiés, jamais commités.
-    mounts: [{ host: task.skillsDir, container: "/work/.claude/skills", readonly: true }],
-    onStart: (container) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        void docker(["kill", container]);
-      }, cfg.claude.timeoutMinutes * 60_000);
-      onAbort = () => {
-        aborted = true;
-        void docker(["kill", container]);
-      };
-      if (opts.signal?.aborted) onAbort();
-      else opts.signal?.addEventListener("abort", onAbort);
-    },
-  });
-  const r = await run.finally(() => {
-    clearTimeout(timer);
-    if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
-  });
+  let r: Awaited<ReturnType<typeof runInTask>>;
+  try {
+    r = await runInTask(cfg, task.name, {
+      cmd: command,
+      stdin: prompt,
+      exchangeDir: task.exchangeDir,
+      env: { [TOKEN_ENV]: token },
+      // Les skills du graphe, lus depuis l'hôte : jamais copiés, jamais commités.
+      mounts: [{ host: task.skillsDir, container: "/work/.claude/skills", readonly: true }],
+      onStart: (container) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          void docker(["kill", container]);
+        }, cfg.claude.timeoutMinutes * 60_000);
+        onAbort = () => {
+          aborted = true;
+          void docker(["kill", container]);
+        };
+        if (opts.signal?.aborted) onAbort();
+        else opts.signal?.addEventListener("abort", onAbort);
+      },
+    }).finally(() => {
+      clearTimeout(timer);
+      if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
+    });
+  } catch (err) {
+    if (err instanceof DockerError) return finishFatal("docker", err.message);
+    throw err;
+  }
   const endedAt = new Date();
 
-  const result = parseResult(r.stdout);
+  const session = parseStream(r.stdout);
   const done = await exists(donePath);
-  const outcome: Outcome = aborted
-    ? { kind: "failure", reason: "aborted" }
-    : timedOut
-      ? { kind: "failure", reason: "timeout" }
-      : classify(result?.terminal_reason, done);
+  const quotaBefore = quotaSnapshot(session.rateLimits[0]);
+  const quotaAfter = quotaSnapshot(session.rateLimits[session.rateLimits.length - 1]);
+
+  let outcome: Outcome;
+  if (aborted) outcome = { kind: "failure", reason: "aborted" };
+  else if (timedOut) outcome = { kind: "failure", reason: "timeout" };
+  else if (session.lines === 0 && isDockerDown(r.stderr)) outcome = { kind: "fatal", reason: "docker", detail: r.stderr.trim() };
+  else outcome = classify(session, done);
+
   // Un arrêt demandé ne compte ni comme échec ni comme quoi que ce soit.
   const decision: Decision = aborted
     ? "retry"
@@ -124,14 +141,29 @@ export async function iterate(
 
   let committed = false;
   if (outcome.kind === "completed") {
-    await commitTask(cfg, task.name, r.container);
-    committed = true;
+    try {
+      await commitTask(cfg, task.name, r.container);
+      committed = true;
+    } catch (err) {
+      if (!(err instanceof DockerError)) throw err;
+      // Le travail est fait mais l'état ne peut pas être conservé : on ne
+      // ment pas au curseur, l'itération est réputée n'avoir jamais eu lieu.
+      outcome = { kind: "fatal", reason: "docker", detail: err.message };
+      ts.cursor = nodeName;
+      ts.iterations -= 1;
+      ts.status = "running";
+      await discardContainer(r.container);
+      await rm(donePath, { force: true });
+      applyDecision(state, task, "stop-window");
+    }
   } else {
     await discardContainer(r.container);
     await rm(donePath, { force: true });
   }
+  const finalDecision: Decision = outcome.kind === "fatal" ? "stop-window" : decision;
   if (!aborted) await saveState(cfg.dataDir, state);
 
+  const model = typeof session.init?.model === "string" ? session.init.model : Object.keys(session.result?.modelUsage ?? {})[0];
   const rec: IterationRecord = {
     task: task.name,
     node: nodeName,
@@ -145,22 +177,42 @@ export async function iterate(
     prompt,
     exitCode: r.code,
     timedOut,
-    result,
-    ...(result === null ? { rawStdout: r.stdout } : {}),
+    model: model ?? null,
+    quota: { before: quotaBefore, after: quotaAfter },
+    result: session.result,
+    rateLimits: session.rateLimits,
+    apiRetries: session.apiRetries,
+    ...(session.result === null ? { rawStdout: r.stdout } : {}),
     stderr: r.stderr,
     done,
     outcome,
-    decision,
+    decision: finalDecision,
     committed,
   };
   const logFile = await writeIterationLog(cfg, rec);
 
-  const label = outcome.kind === "completed" ? "completed" : outcome.reason;
+  const label = outcome.kind === "completed" ? "completed" : outcome.kind === "fatal" ? `fatal:${outcome.reason}` : outcome.reason;
   print(`fin      ${endedAt.toISOString()} (${Math.round(rec.durationMs / 1000)}s, code ${r.code})`);
-  print(`issue    ${label}${done ? " + DONE" : ""} → ${decision}${committed ? " (commit)" : " (jeté)"}`);
-  if (result?.total_cost_usd !== undefined) print(`coût     $${result.total_cost_usd.toFixed(4)}, ${result.num_turns ?? "?"} tours`);
-  if (result === null && r.stderr.trim()) print(`stderr   ${r.stderr.trim().split("\n").slice(-3).join("\n         ")}`);
+  print(`issue    ${label}${done ? " + DONE" : ""} → ${finalDecision}${committed ? " (commit)" : " (jeté)"}`);
+  if (session.result?.total_cost_usd !== undefined) {
+    print(`coût     $${session.result.total_cost_usd.toFixed(4)}, ${session.result.num_turns ?? "?"} tours${model ? `, ${model}` : ""}`);
+  }
+  if (quotaAfter) print(`quota    ${describeQuota(quotaBefore)} → ${describeQuota(quotaAfter)}`);
+  if (outcome.kind === "fatal") print(`panne    ${outcome.detail.split("\n")[0]}`);
+  if (session.result === null && r.stderr.trim()) print(`stderr   ${r.stderr.trim().split("\n").slice(-3).join("\n         ")}`);
   print(`curseur  ${ts.cursor}`);
   print(`log      ${logFile}`);
-  return { node: nodeName, outcome, decision, logFile, costUsd: result?.total_cost_usd };
+  return { node: nodeName, outcome, decision: finalDecision, logFile, costUsd: session.result?.total_cost_usd, quotaAfter };
+
+  function finishFatal(reason: "auth" | "docker", detail: string): IterateResult {
+    const outcome: Outcome = { kind: "fatal", reason, detail };
+    print(`panne    ${detail.split("\n")[0]}`);
+    return { node: nodeName, outcome, decision: "stop-window", logFile: null };
+  }
+}
+
+export function describeQuota(q: QuotaSnapshot | null): string {
+  if (!q) return "?";
+  const pct = (w?: { utilization: number }) => (w ? `${Math.round(w.utilization * 1000) / 10}%` : "?");
+  return `5h ${pct(q.five_hour)} / 7j ${pct(q.seven_day)}`;
 }

@@ -15,6 +15,7 @@
     "dockerfileDir": "./docker",
     "flattenAfterLayers": 30
   },
+  "windows": [],
   "scheduler": {
     "backoffMinutes": 15,
     "retrySeconds": 60,

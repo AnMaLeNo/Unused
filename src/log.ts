@@ -1,7 +1,7 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Config } from "./config.js";
-import type { ClaudeResult } from "./claude.js";
+import type { ClaudeResult, QuotaSnapshot, RateLimitInfo } from "./claude.js";
 import type { Decision, Outcome } from "./graph.js";
 
 export interface IterationRecord {
@@ -17,8 +17,14 @@ export interface IterationRecord {
   prompt: string;
   exitCode: number;
   timedOut: boolean;
-  // Le JSON complet rendu par la session, tel quel.
+  model: string | null;
+  // Les fenêtres de quota (5 h / 7 j) au premier et au dernier événement de la
+  // session : c'est ce qui permet de rapprocher un coût en $ d'un % de quota.
+  quota: { before: QuotaSnapshot | null; after: QuotaSnapshot | null };
+  // Le message `result` final, tel quel.
   result: ClaudeResult | null;
+  rateLimits: RateLimitInfo[];
+  apiRetries: { error?: string; error_status?: number | null }[];
   // Sortie brute si le JSON était illisible, pour comprendre pourquoi.
   rawStdout?: string;
   stderr: string;
@@ -44,12 +50,17 @@ export async function writeIterationLog(cfg: Config, rec: IterationRecord): Prom
     at: rec.startedAt,
     task: rec.task,
     node: rec.node,
-    outcome: rec.outcome.kind === "completed" ? "completed" : rec.outcome.reason,
+    outcome: rec.outcome.kind === "completed" ? "completed" : rec.outcome.kind === "fatal" ? `fatal:${rec.outcome.reason}` : rec.outcome.reason,
     done: rec.done,
     decision: rec.decision,
     durationMs: rec.durationMs,
     costUsd: rec.result?.total_cost_usd ?? null,
     turns: rec.result?.num_turns ?? null,
+    model: rec.model,
+    fiveHourBefore: rec.quota.before?.five_hour?.utilization ?? null,
+    fiveHourAfter: rec.quota.after?.five_hour?.utilization ?? null,
+    sevenDayBefore: rec.quota.before?.seven_day?.utilization ?? null,
+    sevenDayAfter: rec.quota.after?.seven_day?.utilization ?? null,
     file: path.relative(cfg.dataDir, file),
   };
   await appendFile(path.join(logsDir(cfg), "index.jsonl"), JSON.stringify(line) + "\n", "utf8");

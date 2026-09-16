@@ -1,3 +1,4 @@
+import { quotaRejection, type ClaudeResult, type RateLimitInfo } from "./claude.js";
 import type { TaskState, RunnerState } from "./state.js";
 import type { Task } from "./task.js";
 
@@ -13,27 +14,42 @@ import type { Task } from "./task.js";
  */
 export type Outcome =
   | { kind: "completed"; done: boolean }
-  // Quota saturé : ni la tâche ni le nœud ne bougent, tout le monde attend.
-  | { kind: "quota"; reason: string }
-  // Tout le reste : erreur API, crash, sortie illisible, coupure par budget/tours…
-  | { kind: "failure"; reason: string };
+  // Quota saturé (rate_limit_event rejected) : ni la tâche ni le nœud ne
+  // bougent, tout le monde attend — jusqu'à `resetsAt` (epoch s) si connu.
+  | { kind: "quota"; reason: string; resetsAt?: number }
+  // Tout le reste : erreur API, crash, sortie illisible, contexte plein
+  // (blocking_limit), coupure par budget/tours…
+  | { kind: "failure"; reason: string }
+  // Panne globale : rien ne peut réussir tant que ce n'est pas réparé.
+  | { kind: "fatal"; reason: "auth" | "docker"; detail: string };
 
 export type Decision =
   | "next-task" // completed → curseur avancé, on passe à la tâche suivante
   | "task-done" // completed + DONE → tâche terminée, sortie de la file
   | "backoff" // quota → attente globale, puis même tâche, même nœud
   | "retry" // échec → même tâche, même nœud
-  | "task-failed"; // trop d'échecs consécutifs → tâche sortie de la file
+  | "task-failed" // trop d'échecs consécutifs → tâche sortie de la file
+  | "stop-window"; // panne globale → la plage s'arrête, même tâche, même nœud au retour
 
-const QUOTA_REASONS = new Set(["blocking_limit", "rapid_refill_breaker"]);
+const AUTH_STATUSES = new Set([401, 403]);
 
-/** Traduit le `terminal_reason` du JSON de `claude -p` (absent si la sortie était illisible). */
-export function classify(terminalReason: string | undefined, done: boolean): Outcome {
-  if (terminalReason === "completed") return { kind: "completed", done };
-  if (terminalReason !== undefined && QUOTA_REASONS.has(terminalReason)) {
-    return { kind: "quota", reason: terminalReason };
+/**
+ * Traduit la fin d'une session. Le quota se lit dans les événements
+ * rate_limit_event (un `rejected`), pas dans terminal_reason : `blocking_limit`
+ * y désigne la fenêtre de contexte pleine, pas le quota.
+ */
+export function classify(
+  session: { result: ClaudeResult | null; rateLimits: RateLimitInfo[] },
+  done: boolean,
+): Outcome {
+  const rejected = quotaRejection(session.rateLimits);
+  if (rejected) return { kind: "quota", reason: rejected.rateLimitType, resetsAt: rejected.resetsAt };
+  const r = session.result;
+  if (r?.terminal_reason === "completed") return { kind: "completed", done };
+  if (r?.api_error_status !== undefined && r.api_error_status !== null && AUTH_STATUSES.has(r.api_error_status)) {
+    return { kind: "fatal", reason: "auth", detail: `HTTP ${r.api_error_status} : ${r.result ?? "authentification refusée"}` };
   }
-  return { kind: "failure", reason: terminalReason ?? "unreadable_output" };
+  return { kind: "failure", reason: r?.terminal_reason ?? "unreadable_output" };
 }
 
 export interface ApplyOptions {
@@ -53,7 +69,13 @@ export function applyOutcome(
 ): Decision {
   const node = ts.cursor;
   const label =
-    outcome.kind === "completed" ? (outcome.done ? "completed+DONE" : "completed") : outcome.reason;
+    outcome.kind === "completed"
+      ? outcome.done
+        ? "completed+DONE"
+        : "completed"
+      : outcome.kind === "fatal"
+        ? `fatal:${outcome.reason}`
+        : outcome.reason;
   ts.last = { at: (opts.now ?? (() => new Date()))().toISOString(), node, outcome: label };
 
   switch (outcome.kind) {
@@ -69,6 +91,8 @@ export function applyOutcome(
     }
     case "quota":
       return "backoff";
+    case "fatal":
+      return "stop-window";
     case "failure": {
       ts.consecutiveFailures += 1;
       if (ts.consecutiveFailures >= opts.maxConsecutiveFailures) {
@@ -122,6 +146,7 @@ export function applyDecision(state: RunnerState, task: Task, decision: Decision
       return;
     case "backoff":
     case "retry":
+    case "stop-window":
       state.currentTask = task.name;
       return;
   }

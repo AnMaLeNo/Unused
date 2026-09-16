@@ -11,13 +11,14 @@ export interface WindowSummary {
   backoffs: number;
   failures: number;
   costUsd: number;
-  endedBecause: "window" | "nothing-eligible" | "stopped";
+  endedBecause: "window" | "nothing-eligible" | "stopped" | "fatal";
+  fatal?: { reason: "auth" | "docker"; detail: string };
 }
 
 export type SchedulerEvent =
   | { type: "iteration-start"; task: string; node: string; at: string }
   | { type: "iteration-end"; task: string; node: string; result: IterateResult }
-  | { type: "backoff"; ms: number }
+  | { type: "backoff"; ms: number; until: string }
   | { type: "end"; summary: WindowSummary };
 
 export interface SchedulerDeps {
@@ -44,9 +45,11 @@ export function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Fait tourner les tâches actives jusqu'à `until`, en round-robin, une
+ * Fait tourner les tâches actives jusqu'à `deadline()`, en round-robin, une
  * itération à la fois. Une itération commencée avant la fin de la plage va
- * jusqu'au bout. Sur quota saturé, tout le monde attend `backoffMinutes`.
+ * jusqu'au bout. Sur quota saturé, tout le monde dort jusqu'au reset annoncé
+ * (sinon `backoffMinutes`). La fin de plage est réévaluée à chaque tour : une
+ * plage automatique qui s'ouvre pendant une plage manuelle la prolonge.
  * Les tâches sont rechargées avant chaque itération si un chargeur est donné :
  * modifier un task.json ou un skill pendant la plage est pris en compte.
  */
@@ -54,10 +57,11 @@ export async function runWindow(
   cfg: Config,
   tasks: Task[] | (() => Promise<Task[]>),
   state: RunnerState,
-  until: Date,
+  deadline: Date | (() => Date),
   signal: AbortSignal,
   partial: Partial<SchedulerDeps> = {},
 ): Promise<WindowSummary> {
+  const until = typeof deadline === "function" ? deadline : () => deadline;
   const deps: SchedulerDeps = {
     runIteration: (task, st, sig) => iterate(cfg, task, st, { print: (l) => deps.print(`  ${l}`), signal: sig }),
     sleep,
@@ -71,12 +75,12 @@ export async function runWindow(
   const summary: WindowSummary = { iterations: 0, completed: 0, backoffs: 0, failures: 0, costUsd: 0, endedBecause: "window" };
 
   const startedAt = deps.now();
-  state.window = { startedAt: startedAt.toISOString(), until: until.toISOString() };
+  state.window = { startedAt: startedAt.toISOString(), until: until().toISOString() };
   await saveState(cfg.dataDir, state);
-  deps.print(`plage jusqu'à ${until.toISOString()} (${formatDuration(until.getTime() - startedAt.getTime())})`);
+  deps.print(`plage jusqu'à ${until().toISOString()} (${formatDuration(until().getTime() - startedAt.getTime())})`);
 
   let stopped = false;
-  while (!signal.aborted && deps.now() < until) {
+  while (!signal.aborted && deps.now() < until()) {
     if (deps.shouldStop()) {
       stopped = true;
       break;
@@ -104,23 +108,34 @@ export async function runWindow(
         break;
       case "backoff": {
         summary.backoffs += 1;
-        const remaining = until.getTime() - deps.now().getTime();
-        const wait = Math.min(cfg.scheduler.backoffMinutes * 60_000, remaining);
+        const nowMs = deps.now().getTime();
+        const resetsAt = r.outcome.kind === "quota" ? r.outcome.resetsAt : undefined;
+        // Jusqu'au reset annoncé (plus une marge), sinon l'attente aveugle.
+        const target = resetsAt !== undefined ? resetsAt * 1000 + 30_000 - nowMs : cfg.scheduler.backoffMinutes * 60_000;
+        const wait = Math.min(Math.max(target, 60_000), until().getTime() - nowMs);
         if (wait <= 0) break;
-        deps.print(`  quota saturé, attente ${formatDuration(wait)}`);
-        deps.onEvent({ type: "backoff", ms: wait });
+        const untilIso = new Date(nowMs + wait).toISOString();
+        deps.print(`  quota ${r.outcome.kind === "quota" ? r.outcome.reason : ""} saturé, reprise à ${untilIso} (${formatDuration(wait)})`);
+        deps.onEvent({ type: "backoff", ms: wait, until: untilIso });
         await deps.sleep(wait, signal);
+        break;
+      }
+      case "stop-window": {
+        summary.endedBecause = "fatal";
+        if (r.outcome.kind === "fatal") summary.fatal = { reason: r.outcome.reason, detail: r.outcome.detail };
+        deps.print(`  panne globale (${summary.fatal?.reason ?? "?"}) : la plage s'arrête`);
         break;
       }
       case "retry":
       case "task-failed": {
         summary.failures += 1;
         if (r.decision === "task-failed") deps.print(`  ${task.name} sortie de la file après ${cfg.scheduler.maxConsecutiveFailures} échecs consécutifs`);
-        const wait = Math.min(cfg.scheduler.retrySeconds * 1000, until.getTime() - deps.now().getTime());
+        const wait = Math.min(cfg.scheduler.retrySeconds * 1000, until().getTime() - deps.now().getTime());
         if (wait > 0) await deps.sleep(wait, signal);
         break;
       }
     }
+    if (summary.endedBecause === "fatal") break;
   }
 
   if (signal.aborted) {
@@ -128,12 +143,13 @@ export async function runWindow(
     // La plage reste enregistrée : le démon la reprendra au prochain démarrage.
   } else {
     if (stopped) summary.endedBecause = "stopped";
-    state.window = null;
+    // Une panne globale garde la plage : réparée, le démon la reprendra.
+    if (summary.endedBecause !== "fatal") state.window = null;
     await saveState(cfg.dataDir, state);
   }
   deps.onEvent({ type: "end", summary });
   deps.print(
-    `\nfin de plage (${summary.endedBecause}) : ${summary.iterations} itérations, ${summary.completed} completed, ` +
+    `\nfin de plage (${summary.endedBecause}${summary.fatal ? ` ${summary.fatal.reason}` : ""}) : ${summary.iterations} itérations, ${summary.completed} completed, ` +
       `${summary.failures} échecs, ${summary.backoffs} attentes quota, $${summary.costUsd.toFixed(2)}`,
   );
   return summary;

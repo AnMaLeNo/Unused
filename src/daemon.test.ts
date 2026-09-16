@@ -20,7 +20,8 @@ let loop: Promise<void>;
 // Scheduler factice : tourne jusqu'à abort, shouldStop, ou `until` simulé par `finish()`.
 let finish: (() => void) | null = null;
 let seen: { until: Date; deps: Partial<SchedulerDeps> }[] = [];
-const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, state, until, signal, deps = {}) => {
+const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, state, deadline, signal, deps = {}) => {
+  const until = typeof deadline === "function" ? deadline() : deadline;
   seen.push({ until, deps });
   state.window = { startedAt: new Date().toISOString(), until: until.toISOString() };
   await saveState(cfg.dataDir, state);
@@ -45,7 +46,7 @@ const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, state, until, signa
 
 async function boot(initial?: RunnerState): Promise<void> {
   if (initial) await saveState(cfg.dataDir, initial);
-  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {} });
+  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x" });
   await daemon.init();
   server = createApi(cfg, daemon);
   await listen(server, sock);
@@ -69,6 +70,7 @@ beforeEach(async () => {
     tasksDir: path.join(root, "tasks"),
     dataDir: path.join(root, "data"),
     docker: { baseImage: "base", dockerfileDir: root, flattenAfterLayers: 30 },
+    windows: [],
     claude: { sessionArgs: [], timeoutMinutes: 1 },
     scheduler: { backoffMinutes: 1, retrySeconds: 0, maxConsecutiveFailures: 3 },
   };
@@ -148,13 +150,93 @@ describe("daemon + api", () => {
     await shutdown();
   });
 
-  it("start refuse sans image de base", async () => {
-    daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => false });
+  it("start refuse sans image de base, ou sans Docker", async () => {
+    daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => false, dockerVersion: async () => "x" });
     await daemon.init();
     server = createApi(cfg, daemon);
     await listen(server, sock);
-    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409 });
+    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409, message: /image de base/ });
     server.close();
+    daemon = new Daemon(cfg, { runWindow: fakeRunWindow, dockerVersion: async () => { throw new Error("Cannot connect"); } });
+    await daemon.init();
+    server = createApi(cfg, daemon);
+    await listen(server, sock);
+    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409, message: /Docker ne répond pas/ });
+    server.close();
+  });
+
+  it("plage automatique : démarre seule, stop la met en pause jusqu'à sa fin", async () => {
+    const now = new Date();
+    const hhmm = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const days = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+    const start = new Date(now.getTime() - 60_000);
+    const end = new Date(now.getTime() + 2 * 3_600_000);
+    cfg.windows = [{ days: [days[start.getDay()]!], from: hhmm(start), to: hhmm(end) }];
+    await boot();
+    await tick();
+    const s1 = await status();
+    expect(s1.window?.source).toBe("calendar");
+    expect(seen).toHaveLength(1);
+    expect(Math.abs(seen[0]!.until.getTime() - end.getTime())).toBeLessThan(60_000);
+
+    await call(sock, "DELETE", "/window");
+    await tick();
+    const s2 = await status();
+    expect(s2.window).toBeNull();
+    expect(s2.pausedUntil).not.toBeNull();
+    expect(seen).toHaveLength(1);
+    // Un start manuel lève la pause.
+    await call(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    expect((await status()).window?.source).toBe("manual+calendar");
+    await shutdown();
+  });
+
+  it("plage automatique sans rien à faire : pause, levée par un reset", async () => {
+    const now = new Date();
+    const hhmm = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const days = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+    const start = new Date(now.getTime() - 60_000);
+    const end = new Date(now.getTime() + 2 * 3_600_000);
+    cfg.windows = [{ days: [days[start.getDay()]!], from: hhmm(start), to: hhmm(end) }];
+    let calls = 0;
+    const idleRun: typeof runWindow = async (_c, _t, state) => {
+      calls += 1;
+      state.window = null;
+      return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "nothing-eligible" };
+    };
+    daemon = new Daemon(cfg, { runWindow: idleRun, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x" });
+    await daemon.init();
+    server = createApi(cfg, daemon);
+    await listen(server, sock);
+    ac = new AbortController();
+    loop = daemon.run(ac.signal);
+    await tick();
+    expect(calls).toBe(1);
+    expect((await status()).pausedUntil).not.toBeNull();
+    await call(sock, "POST", "/tasks/t1/reset");
+    await tick();
+    expect(calls).toBe(2);
+    await shutdown();
+  });
+
+  it("panne globale : plus rien ne tourne jusqu'à un start", async () => {
+    const fatalRun: typeof runWindow = async (_c, _t, state, _d, _s, _deps) => {
+      state.window = { startedAt: "x", until: new Date(Date.now() + 3_600_000).toISOString() };
+      return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "fatal", fatal: { reason: "auth", detail: "401" } };
+    };
+    daemon = new Daemon(cfg, { runWindow: fatalRun, imageExists: async () => true, dockerVersion: async () => "x" });
+    await daemon.init();
+    server = createApi(cfg, daemon);
+    await listen(server, sock);
+    ac = new AbortController();
+    loop = daemon.run(ac.signal);
+    await call(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    const s = await status();
+    expect(s.fatal).toMatchObject({ reason: "auth" });
+    expect(s.window).toBeNull();
+    await shutdown();
   });
 
   it("tasks : reset et active passent par le démon", async () => {

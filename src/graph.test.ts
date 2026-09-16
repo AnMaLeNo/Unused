@@ -25,24 +25,45 @@ function makeTask(name: string, def: Partial<TaskFile> = {}): Task {
 
 const opts = { maxConsecutiveFailures: 3, now: () => new Date("2026-09-12T00:00:00Z") };
 
+const noQuota = { result: null, rateLimits: [] };
+const res = (r: Record<string, unknown>) => ({ result: r, rateLimits: [] });
+
 describe("classify", () => {
-  it("completed sans DONE", () => {
-    expect(classify("completed", false)).toEqual({ kind: "completed", done: false });
+  it("completed sans / avec DONE", () => {
+    expect(classify(res({ terminal_reason: "completed" }), false)).toEqual({ kind: "completed", done: false });
+    expect(classify(res({ terminal_reason: "completed" }), true)).toEqual({ kind: "completed", done: true });
   });
-  it("completed avec DONE", () => {
-    expect(classify("completed", true)).toEqual({ kind: "completed", done: true });
+  it("quota : un rate_limit_event rejected, avec son reset", () => {
+    expect(
+      classify(
+        {
+          result: { terminal_reason: "api_error", api_error_status: 429 },
+          rateLimits: [
+            { status: "allowed", unifiedWindows: { five_hour: { utilization: 0.9, resetsAt: 1 } } },
+            { status: "rejected", rateLimitType: "five_hour", resetsAt: 1789596600 },
+          ],
+        },
+        false,
+      ),
+    ).toEqual({ kind: "quota", reason: "five_hour", resetsAt: 1789596600 });
   });
-  it("quota", () => {
-    expect(classify("blocking_limit", false)).toEqual({ kind: "quota", reason: "blocking_limit" });
-    expect(classify("rapid_refill_breaker", false).kind).toBe("quota");
+  it("le quota prime sur tout, même un completed tardif", () => {
+    expect(classify({ result: { terminal_reason: "completed" }, rateLimits: [{ status: "rejected" }] }, true).kind).toBe("quota");
+  });
+  it("blocking_limit est un échec (contexte plein), pas le quota", () => {
+    expect(classify(res({ terminal_reason: "blocking_limit" }), false)).toEqual({ kind: "failure", reason: "blocking_limit" });
+  });
+  it("401 / 403 : panne globale d'authentification", () => {
+    const o = classify(res({ terminal_reason: "api_error", api_error_status: 401, result: "OAuth token is invalid" }), false);
+    expect(o).toMatchObject({ kind: "fatal", reason: "auth" });
   });
   it("tout le reste est un échec, y compris une sortie illisible", () => {
-    expect(classify("api_error", false)).toEqual({ kind: "failure", reason: "api_error" });
-    expect(classify("max_turns", false).kind).toBe("failure");
-    expect(classify(undefined, false)).toEqual({ kind: "failure", reason: "unreadable_output" });
+    expect(classify(res({ terminal_reason: "api_error", api_error_status: 500 }), false)).toEqual({ kind: "failure", reason: "api_error" });
+    expect(classify(res({ terminal_reason: "max_turns" }), false).kind).toBe("failure");
+    expect(classify(noQuota, false)).toEqual({ kind: "failure", reason: "unreadable_output" });
   });
   it("DONE ne compte que sur un completed", () => {
-    expect(classify("api_error", true).kind).toBe("failure");
+    expect(classify(res({ terminal_reason: "api_error" }), true).kind).toBe("failure");
   });
 });
 
@@ -72,7 +93,7 @@ describe("applyOutcome", () => {
     const task = makeTask("a");
     const ts = ensureTaskState(emptyState(), task);
     ts.consecutiveFailures = 2;
-    expect(applyOutcome(task, ts, { kind: "quota", reason: "blocking_limit" }, opts)).toBe("backoff");
+    expect(applyOutcome(task, ts, { kind: "quota", reason: "five_hour", resetsAt: 1 }, opts)).toBe("backoff");
     expect(ts.cursor).toBe("find");
     expect(ts.consecutiveFailures).toBe(2);
     expect(ts.status).toBe("running");
@@ -95,6 +116,21 @@ describe("applyOutcome", () => {
     applyOutcome(task, ts, { kind: "failure", reason: "api_error" }, opts);
     applyOutcome(task, ts, { kind: "completed", done: false }, opts);
     expect(ts.consecutiveFailures).toBe(0);
+  });
+});
+
+describe("applyOutcome › fatal", () => {
+  it("stop-window : rien ne bouge, la tâche reste collante", () => {
+    const task = makeTask("a");
+    const state = emptyState();
+    const ts = ensureTaskState(state, task);
+    ts.consecutiveFailures = 1;
+    const d = applyOutcome(task, ts, { kind: "fatal", reason: "auth", detail: "401" }, opts);
+    expect(d).toBe("stop-window");
+    expect(ts).toMatchObject({ cursor: "find", status: "running", consecutiveFailures: 1 });
+    expect(ts.last?.outcome).toBe("fatal:auth");
+    applyDecision(state, task, d);
+    expect(state.currentTask).toBe("a");
   });
 });
 

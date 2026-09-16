@@ -80,6 +80,36 @@ de travail *courte* (une session, une décision), et note ce qu'il a fait.
 Découper en deux nœuds — « chercher quoi faire » puis « le faire » — rend
 chaque session petite et la perte d'une itération indolore.
 
+## Plages automatiques
+
+Dans `unused.config.json`, en heure locale de la machine :
+
+```json
+"windows": [
+  { "days": ["mon", "tue", "wed", "thu", "fri"], "from": "23:00", "to": "07:00" },
+  { "days": ["sun"], "from": "22:00", "to": "12:00" }
+]
+```
+
+Le démon travaille dès qu'une plage le dit, manuelle (`start`) ou
+automatique ; elles se cumulent (une plage manuelle de 1 h à 5 h et une
+automatique de 3 h à 10 h font une plage de 1 h à 10 h). `stop` met les plages
+automatiques en pause jusqu'à la fin de la couverture en cours ; `start`,
+`tasks reset` ou `tasks activate` lèvent la pause.
+
+## Quota
+
+Chaque session est lancée en `stream-json` : le démon y lit les événements
+`rate_limit_event` de Claude Code. Quand le quota est atteint (`rejected`), il
+dort jusqu'au `resetsAt` annoncé, puis reprend la même tâche au même nœud. Les
+pourcentages des fenêtres 5 h et 7 jours avant et après chaque itération, le
+coût et le modèle sont dans `data/logs/index.jsonl` : de quoi rapprocher un
+coût en dollars d'un pourcentage de quota.
+
+Deux pannes sont globales et arrêtent la plage au lieu d'épuiser les tâches en
+échecs : le token refusé (401/403) et Docker injoignable. `status` l'affiche en
+tête ; réparer, puis `unused start` ou redémarrer le service.
+
 ## Piloter
 
 ```

@@ -91,15 +91,18 @@ program
     const s = await call<DaemonStatus>(await sock(), "GET", "/status");
     if (opts.json) return console.log(JSON.stringify(s, null, 2));
     console.log(`démon    pid ${s.daemon.pid}, démarré ${s.daemon.startedAt}`);
+    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused start\` ou redémarre le service`);
     const w = s.window;
     if (!w) {
       console.log("plage    aucune");
     } else {
-      console.log(`plage    jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
+      console.log(`plage    ${w.source}, jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
       console.log(`         ${w.iterations} itérations, ${w.completed} completed, ${w.failures} échecs, ${w.backoffs} attentes quota, $${w.costUsd.toFixed(2)}`);
       if (w.current) console.log(`en cours ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
       else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil}`);
     }
+    if (s.nextCalendarStart) console.log(`prochaine plage automatique ${s.nextCalendarStart}`);
+    if (s.pausedUntil) console.log(`pause    plages automatiques ignorées jusqu'à ${s.pausedUntil}`);
     if (s.lastWindow && !w) {
       const l = s.lastWindow;
       console.log(`dernière ${l.iterations} itérations, ${l.completed} completed, ${l.failures} échecs, $${l.costUsd.toFixed(2)} (${l.endedBecause})`);
