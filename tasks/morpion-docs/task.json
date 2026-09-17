@@ -2,7 +2,7 @@
   "active": false,
   "start": "setup",
   "params": {
-    "repo": "OWNER/morpion",
+    "repo": "AnMaLeNo/morpion",
     "branch": "docs"
   },
   "env": [
@@ -13,7 +13,25 @@
     "GIT_COMMITTER_EMAIL=unused@users.noreply.github.com"
   ],
   "nodes": {
-    "setup":    { "skill": "setup",    "next": "document" },
-    "document": { "skill": "document", "next": "document" }
+    "setup": {
+      "skill": "setup",
+      "next": "document",
+      "args": [
+        "--model",
+        "sonnet",
+        "--effort",
+        "high"
+      ]
+    },
+    "document": {
+      "skill": "document",
+      "next": "document",
+      "args": [
+        "--model",
+        "sonnet",
+        "--effort",
+        "high"
+      ]
+    }
   }
 }
