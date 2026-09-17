@@ -7,6 +7,7 @@ import { ConflictError, NotFoundError, type Daemon } from "./daemon.js";
 import { buildBase } from "./docker.js";
 import { dockerCheck } from "./dockerCheck.js";
 import { parseDuration } from "./duration.js";
+import { scaffoldTask } from "./scaffold.js";
 
 export const SOCKET_FILE = "unused.sock";
 
@@ -66,6 +67,16 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
 
       if (route === "DELETE /window") {
         return sendJson(res, 200, await daemon.stopWindow(url.searchParams.get("now") === "1"));
+      }
+
+      if (route === "POST /tasks") {
+        const body = await readJson(req);
+        if (typeof body.name !== "string") throw new HttpError(400, "champ `name` attendu");
+        try {
+          return sendJson(res, 200, { dir: await scaffoldTask(cfg.tasksDir, body.name) });
+        } catch (err) {
+          throw new HttpError(409, (err as Error).message);
+        }
       }
 
       if (route === "GET /tasks") {

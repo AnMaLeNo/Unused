@@ -6,16 +6,36 @@ import { commitTask, discardContainer, docker, DockerError, runInTask } from "./
 import { applyDecision, applyOutcome, classify, type Decision, type Outcome } from "./graph.js";
 import { writeIterationLog, type IterationRecord } from "./log.js";
 import { ensureTaskState, saveState, type RunnerState } from "./state.js";
-import type { Task } from "./task.js";
+import { resolveEnv, type Task } from "./task.js";
 
 export const TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 export const DONE_FILE = "DONE";
+
+/** Les effets de bord d'une itération, remplaçables dans les tests. */
+export interface IterateDeps {
+  runInTask: typeof runInTask;
+  commitTask: typeof commitTask;
+  discardContainer: typeof discardContainer;
+  killContainer: (container: string) => void;
+  env: Record<string, string | undefined>;
+  now: () => Date;
+}
+
+const defaultDeps: IterateDeps = {
+  runInTask,
+  commitTask,
+  discardContainer,
+  killContainer: (c) => void docker(["kill", c]),
+  env: process.env,
+  now: () => new Date(),
+};
 
 export interface IterateOptions {
   dryRun?: boolean;
   print?: (line: string) => void;
   // Arrêt demandé : le container est tué, l'itération est jetée sans toucher à l'état.
   signal?: AbortSignal;
+  deps?: Partial<IterateDeps>;
 }
 
 export interface IterateResult {
@@ -56,6 +76,7 @@ export async function iterate(
   opts: IterateOptions = {},
 ): Promise<IterateResult> {
   const print = opts.print ?? (() => {});
+  const deps: IterateDeps = { ...defaultDeps, ...opts.deps };
   const ts = ensureTaskState(state, task);
   if (ts.status !== "running") {
     throw new Error(`la tâche ${task.name} est ${ts.status === "done" ? "terminée" : "en échec"} ; rien à itérer`);
@@ -75,16 +96,20 @@ export async function iterate(
     return { node: nodeName, outcome: { kind: "failure", reason: "dry_run" }, decision: "retry", logFile: null };
   }
 
-  const token = process.env[TOKEN_ENV];
+  const token = deps.env[TOKEN_ENV];
   if (!token) {
     return finishFatal("auth", `${TOKEN_ENV} absent : lance \`claude setup-token\` et mets le token dans .env`);
+  }
+  const taskEnv = resolveEnv(task.def.env, deps.env);
+  if (taskEnv.missing.length > 0) {
+    return finishFatal("auth", `variables absentes de l'environnement du démon : ${taskEnv.missing.join(", ")}`);
   }
 
   // Un DONE qui traîne d'une itération précédente ne doit pas être pris pour
   // celui de cette session.
   await rm(donePath, { force: true });
 
-  const startedAt = new Date();
+  const startedAt = deps.now();
   print(`départ   ${startedAt.toISOString()}`);
 
   let timedOut = false;
@@ -93,21 +118,21 @@ export async function iterate(
   let onAbort: (() => void) | undefined;
   let r: Awaited<ReturnType<typeof runInTask>>;
   try {
-    r = await runInTask(cfg, task.name, {
+    r = await deps.runInTask(cfg, task.name, {
       cmd: command,
       stdin: prompt,
       exchangeDir: task.exchangeDir,
-      env: { [TOKEN_ENV]: token },
+      env: { ...taskEnv.env, [TOKEN_ENV]: token },
       // Les skills du graphe, lus depuis l'hôte : jamais copiés, jamais commités.
       mounts: [{ host: task.skillsDir, container: "/work/.claude/skills", readonly: true }],
       onStart: (container) => {
         timer = setTimeout(() => {
           timedOut = true;
-          void docker(["kill", container]);
+          deps.killContainer(container);
         }, cfg.claude.timeoutMinutes * 60_000);
         onAbort = () => {
           aborted = true;
-          void docker(["kill", container]);
+          deps.killContainer(container);
         };
         if (opts.signal?.aborted) onAbort();
         else opts.signal?.addEventListener("abort", onAbort);
@@ -120,7 +145,7 @@ export async function iterate(
     if (err instanceof DockerError) return finishFatal("docker", err.message);
     throw err;
   }
-  const endedAt = new Date();
+  const endedAt = deps.now();
 
   const session = parseStream(r.stdout);
   const done = await exists(donePath);
@@ -142,7 +167,7 @@ export async function iterate(
   let committed = false;
   if (outcome.kind === "completed") {
     try {
-      await commitTask(cfg, task.name, r.container);
+      await deps.commitTask(cfg, task.name, r.container);
       committed = true;
     } catch (err) {
       if (!(err instanceof DockerError)) throw err;
@@ -152,12 +177,12 @@ export async function iterate(
       ts.cursor = nodeName;
       ts.iterations -= 1;
       ts.status = "running";
-      await discardContainer(r.container);
+      await deps.discardContainer(r.container);
       await rm(donePath, { force: true });
       applyDecision(state, task, "stop-window");
     }
   } else {
-    await discardContainer(r.container);
+    await deps.discardContainer(r.container);
     await rm(donePath, { force: true });
   }
   const finalDecision: Decision = outcome.kind === "fatal" ? "stop-window" : decision;

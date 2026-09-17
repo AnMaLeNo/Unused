@@ -132,6 +132,14 @@ tasks
   });
 
 tasks
+  .command("new <task>")
+  .description("crée le squelette d'une tâche (task.json inactif, README, skills setup et work)")
+  .action(async (name: string) => {
+    const r = await call<{ dir: string }>(await sock(), "POST", "/tasks", { name });
+    console.log(`${r.dir} créé — adapte task.json et les skills, puis \`unused tasks activate ${name}\``);
+  });
+
+tasks
   .command("reset <task>")
   .description("remet une tâche à zéro : état, image Docker, DONE (les autres fichiers d'exchange sont gardés)")
   .action(async (name: string) => {

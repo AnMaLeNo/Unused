@@ -16,10 +16,15 @@ export const TASK_NAME_RE = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
  *
  * Côté hôte, la tâche est décrite par un dossier `tasks/<nom>/` :
  *   task.json              — ce fichier
- *   skills/<skill>/SKILL.md — les skills du graphe, copiés dans le container
+ *   skills/<skill>/SKILL.md — les skills du graphe, montés dans le container
  *   exchange/              — monté sur /exchange dans le container (DONE, …)
  * Le container, lui, est l'espace de travail de Claude : il y fait ce qu'il veut.
+ *
+ * `env` : les variables d'environnement à donner au container, avec la
+ * sémantique de `docker run -e` — "NOM" transmet la valeur de l'hôte (le .env
+ * du démon), "NOM=valeur" la fixe. Le token Claude est toujours transmis.
  */
+const ENV_ENTRY_RE = /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/;
 const NodeSchema = z
   .object({
     // Nom du skill, invoqué par `/<skill>` ; doit exister dans skills/<skill>/SKILL.md.
@@ -38,6 +43,7 @@ const TaskFileSchema = z
     active: z.boolean().default(true),
     start: z.string().min(1),
     params: z.record(z.string()).default({}),
+    env: z.array(z.string().regex(ENV_ENTRY_RE, 'attendu "NOM" ou "NOM=valeur"')).default([]),
     nodes: z.record(NodeSchema),
   })
   .strict()
@@ -74,6 +80,29 @@ export interface Task {
 export interface TaskLoadError {
   name: string;
   message: string;
+}
+
+/**
+ * Résout `env` : "NOM" prend la valeur dans `source`, "NOM=valeur" est
+ * littéral. Retourne aussi les noms introuvables dans `source`.
+ */
+export function resolveEnv(
+  entries: string[],
+  source: Record<string, string | undefined>,
+): { env: Record<string, string>; missing: string[] } {
+  const env: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const e of entries) {
+    const i = e.indexOf("=");
+    if (i >= 0) {
+      env[e.slice(0, i)] = e.slice(i + 1);
+      continue;
+    }
+    const v = source[e];
+    if (v === undefined) missing.push(e);
+    else env[e] = v;
+  }
+  return { env, missing };
 }
 
 export function skillFile(task: Pick<Task, "skillsDir">, skill: string): string {
@@ -123,6 +152,10 @@ export async function loadTask(dir: string): Promise<Task> {
     throw new Error(
       `skills introuvables (attendus dans skills/<nom>/SKILL.md) : ${[...new Set(missing)].join(", ")}`,
     );
+  }
+  const env = resolveEnv(task.def.env, process.env);
+  if (env.missing.length > 0) {
+    throw new Error(`variables absentes de l'environnement du démon (.env) : ${env.missing.join(", ")}`);
   }
   return task;
 }
