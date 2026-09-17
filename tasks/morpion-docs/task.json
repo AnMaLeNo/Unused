@@ -1,0 +1,19 @@
+{
+  "active": false,
+  "start": "setup",
+  "params": {
+    "repo": "OWNER/morpion",
+    "branch": "docs"
+  },
+  "env": [
+    "GH_TOKEN",
+    "GIT_AUTHOR_NAME=unused",
+    "GIT_AUTHOR_EMAIL=unused@users.noreply.github.com",
+    "GIT_COMMITTER_NAME=unused",
+    "GIT_COMMITTER_EMAIL=unused@users.noreply.github.com"
+  ],
+  "nodes": {
+    "setup":    { "skill": "setup",    "next": "document" },
+    "document": { "skill": "document", "next": "document" }
+  }
+}
