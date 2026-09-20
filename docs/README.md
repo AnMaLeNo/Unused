@@ -5,3 +5,4 @@
 - [Le cycle d'une itération](cycle-d-iteration.md) — session `claude -p`, classification de l'issue, commit ou rejet
 - [Le container comme état persistant](container-etat-persistant.md) — commit, rotation `:prev`, aplatissement
 - [Le parsing de la sortie Claude](parsing-sortie-claude.md) — stream-json, terminal_reason, quota
+- [Le scheduler](scheduler.md) — round-robin, attente sur quota saturé, fin de plage
