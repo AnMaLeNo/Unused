@@ -6,3 +6,4 @@
 - [Le container comme état persistant](container-etat-persistant.md) — commit, rotation `:prev`, aplatissement
 - [Le parsing de la sortie Claude](parsing-sortie-claude.md) — stream-json, terminal_reason, quota
 - [Le scheduler](scheduler.md) — round-robin, attente sur quota saturé, fin de plage
+- [Le démon](le-demon.md) — boucle principale, plages manuelles/auto cumulées, pannes globales, reprise après redémarrage
