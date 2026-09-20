@@ -10,6 +10,10 @@ set -euo pipefail
 
 DIR=/opt/unused
 USER_NAME=unused
+# Le groupe du service : il donne accès à Docker, et c'est par lui que les
+# comptes humains atteignent le socket du démon (y être équivaut déjà à root
+# sur l'hôte, donc cela n'ouvre rien de plus).
+GROUP_NAME=docker
 UNIT=/etc/systemd/system/unused.service
 
 [ "$(id -u)" -eq 0 ] || { echo "à lancer avec sudo" >&2; exit 1; }
@@ -20,7 +24,7 @@ command -v docker >/dev/null || { echo "docker introuvable" >&2; exit 1; }
 # L'utilisateur du service : sans shell, membre de docker (équivalent root sur
 # l'hôte — acceptable sur une machine dédiée, à savoir).
 if ! id "$USER_NAME" >/dev/null 2>&1; then
-  useradd --system --home-dir "$DIR" --shell /usr/sbin/nologin --groups docker "$USER_NAME"
+  useradd --system --home-dir "$DIR" --shell /usr/sbin/nologin --groups "$GROUP_NAME" "$USER_NAME"
   echo "utilisateur $USER_NAME créé"
 fi
 
@@ -33,12 +37,13 @@ npm prune --omit=dev --no-audit --no-fund
 # peut que le lire. Seuls data/ et tasks/ lui sont ouverts en écriture.
 OWNER=$(stat -c %U "$DIR/package.json")
 mkdir -p data tasks
-chown -R "$OWNER:$USER_NAME" "$DIR"
+chown -R "$OWNER:$GROUP_NAME" "$DIR"
 chmod -R g+rX,o-rwx "$DIR"
-chown -R "$USER_NAME:$USER_NAME" data tasks
+# data/ porte le socket : le groupe doit pouvoir y entrer pour piloter.
+chown -R "$USER_NAME:$GROUP_NAME" data tasks
 chmod 770 data tasks
 if [ -f .env ]; then
-  chown "$USER_NAME:$USER_NAME" .env
+  chown "$USER_NAME:$GROUP_NAME" .env
   chmod 600 .env
 else
   echo "ATTENTION : pas de .env — le démon refusera de travailler sans CLAUDE_CODE_OAUTH_TOKEN" >&2
@@ -69,5 +74,5 @@ fi
 sleep 1
 systemctl --no-pager --lines=3 status unused || true
 echo
-echo "Pour piloter depuis ce compte : ajoute-toi au groupe docker (sudo usermod -aG docker \$USER, puis reconnexion),"
+echo "Pour piloter depuis ce compte : être dans le groupe $GROUP_NAME (sudo usermod -aG $GROUP_NAME \$USER, puis reconnexion),"
 echo "puis : unused status · unused docker build · unused tasks list"
