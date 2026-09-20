@@ -29,9 +29,16 @@ npm ci --no-audit --no-fund
 npm run build
 npm prune --omit=dev --no-audit --no-fund
 
+# Le code appartient au compte qui déploie (git pull sans sudo) ; le service ne
+# peut que le lire. Seuls data/ et tasks/ lui sont ouverts en écriture.
+OWNER=$(stat -c %U "$DIR/package.json")
 mkdir -p data tasks
-chown -R "$USER_NAME:$USER_NAME" "$DIR"
+chown -R "$OWNER:$USER_NAME" "$DIR"
+chmod -R g+rX,o-rwx "$DIR"
+chown -R "$USER_NAME:$USER_NAME" data tasks
+chmod 770 data tasks
 if [ -f .env ]; then
+  chown "$USER_NAME:$USER_NAME" .env
   chmod 600 .env
 else
   echo "ATTENTION : pas de .env — le démon refusera de travailler sans CLAUDE_CODE_OAUTH_TOKEN" >&2

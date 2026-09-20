@@ -1,5 +1,7 @@
 node_modules/
 dist/
 data/
-tasks/*/exchange/
 .env
+# Les tâches sont personnelles (secrets, dépôts, skills propres à chacun).
+# `unused tasks new` en crée le squelette ; rien de tout cela n'est versionné.
+tasks/

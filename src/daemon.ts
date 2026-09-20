@@ -226,6 +226,9 @@ export class Daemon {
   }
 
   private async pauseUntil(until: Date, why: string): Promise<void> {
+    // Sans calendrier, il n'y a rien à mettre en pause : seules les plages
+    // automatiques sont concernées, une plage manuelle ne revient pas seule.
+    if (this.cfg.windows.length === 0) return;
     if (until.getTime() <= this.deps.now().getTime()) return;
     this.state.pausedUntil = until.toISOString();
     await saveState(this.cfg.dataDir, this.state);
