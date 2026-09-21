@@ -13,3 +13,4 @@
 - [Les logs d'itération](logs-d-iteration.md) — `IterationRecord`, fichier par itération et `index.jsonl`, rapprochement coût/quota
 - [Écrire et créer une tâche](creer-une-tache.md) — structure de dossier, `unused tasks new`, scaffold, exemple
 - [`dockerCheck`](verification-docker.md) — vérifier le cycle Docker de bout en bout sans consommer de quota
+- [Déploiement](deploiement.md) — `install.sh`, service systemd, utilisateur et permissions
