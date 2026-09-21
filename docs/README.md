@@ -7,3 +7,4 @@
 - [Le parsing de la sortie Claude](parsing-sortie-claude.md) — stream-json, terminal_reason, quota
 - [Le scheduler](scheduler.md) — round-robin, attente sur quota saturé, fin de plage
 - [Le démon](le-demon.md) — boucle principale, plages manuelles/auto cumulées, pannes globales, reprise après redémarrage
+- [Les plages automatiques](plages-automatiques.md) — calcul de couverture et prochain départ
