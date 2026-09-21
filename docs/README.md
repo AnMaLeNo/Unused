@@ -8,3 +8,4 @@
 - [Le scheduler](scheduler.md) — round-robin, attente sur quota saturé, fin de plage
 - [Le démon](le-demon.md) — boucle principale, plages manuelles/auto cumulées, pannes globales, reprise après redémarrage
 - [Les plages automatiques](plages-automatiques.md) — calcul de couverture et prochain départ
+- [L'API HTTP et la CLI cliente](api-et-cli.md) — routes du démon, socket Unix, streaming, `unused` en ligne de commande
