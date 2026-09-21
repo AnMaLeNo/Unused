@@ -11,3 +11,4 @@
 - [L'API HTTP et la CLI cliente](api-et-cli.md) — routes du démon, socket Unix, streaming, `unused` en ligne de commande
 - [La configuration du démon](configuration-du-demon.md) — schéma `unused.config.json`, résolution des chemins, chargement du `.env`
 - [Les logs d'itération](logs-d-iteration.md) — `IterationRecord`, fichier par itération et `index.jsonl`, rapprochement coût/quota
+- [Écrire et créer une tâche](creer-une-tache.md) — structure de dossier, `unused tasks new`, scaffold, exemple
