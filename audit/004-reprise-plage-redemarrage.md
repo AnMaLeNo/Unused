@@ -4,9 +4,9 @@
 `src/daemon.ts:177-250` (`execute`, `pauseUntil`), `src/daemon.ts:284-326`
 (`startWindow`, `stopWindow`), `src/daemon.ts:328-373` (`status`),
 `src/scheduler.ts:56-155`, `src/state.ts:178-240`, `src/iterate.ts:116-190`,
-`src/graph.ts:60-105`, `src/cli.ts:35-64,86-111`, `deploy/unused.service`,
+`src/graph.ts:60-105`, `src/cli.ts:35-64,86-111`, `src/api.ts:127-155`, `deploy/unused.service`,
 `src/daemon.test.ts:126-240`
-**Verdict** : 3 constats (2 sûrs, 1 probable)
+**Verdict** : 4 constats (2 sûrs, 1 probable, 1 à vérifier)
 
 ## Une plage *automatique* interrompue revient au démarrage déguisée en plage manuelle
 
@@ -179,6 +179,60 @@ Aggravant : une tâche `failed` n'est plus éligible (`graph.ts:107-110`) et
 `removeTaskImages(name)` et détruit donc l'image où s'accumulait le travail de
 la tâche.
 
+## `init()` écrit dans `state.json` avant que `listen()` n'ait établi l'exclusivité
+
+**Gravité** : à vérifier
+**Où** : `src/cli.ts:41-45` (avec `src/daemon.ts:103-107` et `src/state.ts:78-84`)
+
+Le démon se présente comme « seul propriétaire de state.json »
+(`daemon.ts:72`), et cette exclusivité est garantie par `listen()`, qui sonde le
+socket et refuse de démarrer si un démon répond déjà (`api.ts:144-146`). Mais
+l'ordre d'exécution place l'écriture **avant** ce contrôle :
+
+```ts
+// cli.ts:41-45
+const daemon = new Daemon(cfg, { print: log });
+await daemon.init();                    // peut écrire state.json
+const server = createApi(cfg, daemon);
+const sock = socketPath(cfg);
+await listen(server, sock);             // c'est seulement ici qu'on refuse le doublon
+```
+
+Et la branche d'oubli d'`init()` écrit bel et bien :
+
+```ts
+// daemon.ts:103-107
+} else {
+  this.deps.print("plage enregistrée expirée, oubliée");
+  this.state.window = null;
+  await saveState(this.cfg.dataDir, this.state);
+}
+```
+
+Un second `unused daemon` lancé à la main pendant que le service tourne effectue
+donc un cycle `loadState` → `saveState` complet sur le fichier du démon légitime
+avant d'échouer sur « un démon répond déjà » — message qui laisse croire qu'il
+n'a rien touché. Deux conséquences, qui n'ont pas pu être exécutées faute de
+`node` dans ce conteneur :
+
+- perte d'écriture : si le démon légitime sauve entre le `loadState` et le
+  `saveState` de l'intrus, sa mise à jour est écrasée par l'instantané périmé.
+  L'intervalle est très court (un seul test de date), donc le scénario est peu
+  probable ;
+- fichier temporaire partagé : `saveState` utilise un chemin fixe `${file}.tmp`
+  pour tout le monde (`state.ts:81-83`). Deux processus qui sauvent en même temps
+  écrivent dans le *même* fichier avant de le `rename`, ce que l'écriture
+  atomique annoncée ligne 77 est précisément censée empêcher. Un `state.json`
+  tronqué ou mélangé fait ensuite échouer `loadState` (`state.ts:70-73`,
+  « state.json invalide ») et le démon refuse de démarrer.
+
+À distinguer de la course examinée plus bas (un `stop` arrivant pendant la
+reprise), qui, elle, ne tient pas : cette fenêtre-là est refermée par l'ordre des
+microtâches. Ici il ne s'agit pas de l'API mais de deux processus qui écrivent le
+même fichier, et `listen()` — le seul verrou existant — arrive trop tard pour
+l'empêcher. Ce qui reste à mesurer, c'est la fenêtre réelle de collision ; le
+remède (déplacer `listen()` avant `init()`, ou n'écrire qu'après) est sans coût.
+
 ## Ce qui a été vérifié et tient
 
 - L'expiration à la reprise est correcte et durable : `init` remet
@@ -209,3 +263,19 @@ la tâche.
   se voit qu'au redémarrage suivant — plage abandonnée sur erreur mais reprise
   quand même. Trop dépendant d'un `saveState` ultérieur fortuit pour être
   chiffré ici, mais c'est le même défaut d'atomicité que le constat 2.
+- Le `until` enregistré est **figé** : `runWindow` l'évalue une seule fois
+  (`scheduler.ts:78`) alors que la boucle réévalue `until()` à chaque tour
+  (`scheduler.ts:83`, `115`, `133`). La borne persistée reste donc en retard sur
+  la borne réelle dès qu'un calendrier prolonge la plage. Cherché un scénario où
+  cela perde du travail : il n'y en a pas. Comme `until()` au démarrage vaut déjà
+  `max(manuel, calendrier)`, la borne persistée est toujours **≥** la borne
+  manuelle ; elle ne peut être périmée que dans la portion ajoutée par le
+  calendrier, portion que le calendrier rouvre de lui-même au redémarrage.
+  L'effet visible se limite au message « plage enregistrée expirée, oubliée ».
+- `state.window.startedAt` est écrit (`scheduler.ts:78`) mais relu nulle part
+  dans `src/` : il est écrasé à chaque reprise sans conséquence. Le `startedAt`
+  affiché par `status` vient de `run.startedAt` (`daemon.ts:179`, `daemon.ts:337`),
+  posé à la reprise : une plage ouverte à 22:00 et reprise à 02:00 s'affiche comme
+  démarrée à 02:00. Trompeur, mais aucun calcul n'en dépend.
+- Une date illisible dans `window.until` donne `NaN` : `NaN > now` est faux, donc
+  la plage est oubliée plutôt que reprise indéfiniment (`daemon.ts:100`).
