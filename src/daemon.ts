@@ -197,6 +197,9 @@ export class Daemon {
         run.ac.signal,
         {
           print: this.deps.print,
+          // Seule la part manuelle est à reprendre : le calendrier se relance
+          // seul, selon la config lue au redémarrage.
+          resumeUntil: () => run.manualUntil,
           now: this.deps.now,
           shouldStop: () => run.stopRequested,
           onEvent: (e) => this.onEvent(run, e),
