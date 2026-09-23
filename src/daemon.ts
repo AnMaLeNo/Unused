@@ -1,4 +1,4 @@
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { coverageEnd, nextStart } from "./calendar.js";
 import type { Config } from "./config.js";
@@ -412,8 +412,20 @@ export class Daemon {
     const file = path.join(task.dir, TASK_FILE);
     const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
     raw.active = active;
-    await writeFile(file, JSON.stringify(raw, null, 2) + "\n", "utf8");
-    ensureTaskState(this.state, task);
+    // Fichier temporaire puis rename : le task.json de l'utilisateur n'est
+    // jamais vide ou tronqué, même un instant ou sur disque plein.
+    const tmp = `${file}.tmp`;
+    await writeFile(tmp, JSON.stringify(raw, null, 2) + "\n", "utf8");
+    await chmod(tmp, (await stat(file)).mode);
+    await rename(tmp, file);
+    const ts = ensureTaskState(this.state, task);
+    // Remettre dans la file une tâche sortie sur trop d'échecs, sans toucher
+    // à son curseur ni à son image (c'est ce qui la distingue d'un reset).
+    if (active && ts.status === "failed") {
+      ts.status = "running";
+      ts.consecutiveFailures = 0;
+      await saveState(this.cfg.dataDir, this.state);
+    }
     if (active) await this.unpause();
   }
 
