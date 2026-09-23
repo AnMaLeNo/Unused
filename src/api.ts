@@ -52,6 +52,8 @@ function streamText(res: http.ServerResponse): (line: string) => void {
  * client aujourd'hui ; un front pourra parler aux mêmes routes demain.
  */
 export function createApi(cfg: Config, daemon: Daemon): http.Server {
+  // build ou check en cours : un seul à la fois, ils travaillent sur les mêmes images.
+  let dockerBusy: "build" | "check" | null = null;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://unused");
     const route = `${req.method} ${url.pathname}`;
@@ -94,20 +96,33 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
         return sendJson(res, 200, { name, active: body.active });
       }
 
-      if (route === "POST /docker/build") {
-        const print = streamText(res);
-        await buildBase(cfg, print);
-        return res.end();
-      }
-
-      if (route === "POST /docker/check") {
-        const print = streamText(res);
-        try {
-          await dockerCheck(cfg, { rebuild: url.searchParams.get("rebuild") === "1" }, print);
-        } catch (err) {
-          print(`ERREUR ${(err as Error).message}`);
+      if (route === "POST /docker/build" || route === "POST /docker/check") {
+        const what = route === "POST /docker/build" ? "build" : "check";
+        if (dockerBusy) {
+          streamText(res)(`ERREUR docker ${dockerBusy} déjà en cours (lancé plus tôt, il continue même si sa commande a été interrompue)`);
+          return res.end();
         }
-        return res.end();
+        dockerBusy = what;
+        try {
+          // Le check reconstruit, lance et aplatit des images : pas sous une plage.
+          if (what === "check" && (await daemon.status()).window) {
+            streamText(res)("ERREUR une plage est en cours : relance le check une fois qu'elle est finie (ou après `unused stop`)");
+            return res.end();
+          }
+          const print = streamText(res);
+          if (what === "build") {
+            await buildBase(cfg, print);
+          } else {
+            try {
+              await dockerCheck(cfg, { rebuild: url.searchParams.get("rebuild") === "1" }, print);
+            } catch (err) {
+              print(`ERREUR ${(err as Error).message}`);
+            }
+          }
+          return res.end();
+        } finally {
+          dockerBusy = null;
+        }
       }
 
       throw new HttpError(404, `route inconnue : ${route}`);
