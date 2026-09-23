@@ -23,6 +23,9 @@ export type SchedulerEvent =
 
 export interface SchedulerDeps {
   runIteration: (task: Task, state: RunnerState, signal: AbortSignal) => Promise<IterateResult>;
+  // La fin de plage à reprendre après un redémarrage, ou null s'il n'y a rien
+  // à reprendre. Par défaut, la fin de plage elle-même.
+  resumeUntil?: () => Date | null;
   sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   now: () => Date;
   print: (line: string) => void;
@@ -75,7 +78,8 @@ export async function runWindow(
   const summary: WindowSummary = { iterations: 0, completed: 0, backoffs: 0, failures: 0, costUsd: 0, endedBecause: "window" };
 
   const startedAt = deps.now();
-  state.window = { startedAt: startedAt.toISOString(), until: until().toISOString() };
+  const resume = deps.resumeUntil ? deps.resumeUntil() : until();
+  state.window = resume ? { startedAt: startedAt.toISOString(), until: resume.toISOString() } : null;
   await saveState(cfg.dataDir, state);
   deps.print(`plage jusqu'à ${until().toISOString()} (${formatDuration(until().getTime() - startedAt.getTime())})`);
 
