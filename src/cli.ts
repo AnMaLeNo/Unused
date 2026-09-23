@@ -59,8 +59,13 @@ program
       await daemon.run(ac.signal);
     } finally {
       server.close();
+      // Coupe aussi les requêtes en cours (docker build/check, streamées).
+      server.closeAllConnections();
       log("démon arrêté");
     }
+    // Un build ou un check lancé par l'API tournerait encore et garderait le
+    // processus en vie : l'itération est déjà jetée, l'état à jour, on sort.
+    process.exit(0);
   });
 
 // ------------------------------------------------------- la CLI, cliente
