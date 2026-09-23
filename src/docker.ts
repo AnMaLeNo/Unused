@@ -114,8 +114,10 @@ export interface RunOptions {
   env?: Record<string, string>;
   // Montages supplémentaires (ex. les skills, en lecture seule).
   mounts?: { host: string; container: string; readonly?: boolean }[];
-  // Appelé avec le nom du container juste avant son lancement.
+  // Appelé avec le nom du container juste avant sa création.
   onStart?: (container: string) => void;
+  // Consulté une fois le container créé : vrai, il n'est pas démarré.
+  cancelled?: () => boolean;
 }
 
 export interface RunResult extends ExecResult {
@@ -126,13 +128,17 @@ export interface RunResult extends ExecResult {
 /**
  * Exécute une commande dans un container neuf issu de l'image de la tâche.
  * Le container n'est PAS supprimé : l'appelant le commite (succès) ou le jette.
+ *
+ * Création et démarrage sont séparés (`create` puis `start`) pour savoir quand
+ * le container existe : un arrêt demandé avant ce moment ne peut pas le tuer,
+ * il est donc vérifié là, et le container n'est alors pas démarré.
  */
 export async function runInTask(cfg: Config, taskName: string, opts: RunOptions): Promise<RunResult> {
   const image = await resolveTaskImage(cfg, taskName);
   const container = `unused-${taskName}-${Date.now()}`;
   await mkdir(opts.exchangeDir, { recursive: true });
   const args = [
-    "run",
+    "create",
     "--name",
     container,
     "--label",
@@ -145,7 +151,13 @@ export async function runInTask(cfg: Config, taskName: string, opts: RunOptions)
   for (const name of Object.keys(opts.env ?? {})) args.push("-e", name);
   args.push(image, ...opts.cmd);
   opts.onStart?.(container);
-  const r = await docker(args, { stdin: opts.stdin, env: opts.env });
+  // L'environnement est figé à la création : `start` n'en a plus besoin.
+  const created = await docker(args, { env: opts.env });
+  if (created.code !== 0) return { ...created, container, image };
+  if (opts.cancelled?.()) return { code: -1, stdout: "", stderr: "", container, image };
+  const startArgs = ["start", "--attach"];
+  if (opts.stdin !== undefined) startArgs.push("--interactive");
+  const r = await docker([...startArgs, container], { stdin: opts.stdin });
   return { ...r, container, image };
 }
 

@@ -25,7 +25,10 @@ const defaultDeps: IterateDeps = {
   runInTask,
   commitTask,
   discardContainer,
-  killContainer: (c) => void docker(["kill", c]),
+  // `rm -f` plutôt que `kill` : il tue aussi un container créé mais pas encore
+  // démarré, que `start` ne trouvera alors plus. Un échec est sans effet :
+  // container pas encore créé (runInTask ne le démarrera pas) ou déjà fini.
+  killContainer: (c) => void docker(["rm", "-f", c]).catch(() => {}),
   env: process.env,
   now: () => new Date(),
 };
@@ -137,6 +140,8 @@ export async function iterate(
         if (opts.signal?.aborted) onAbort();
         else opts.signal?.addEventListener("abort", onAbort);
       },
+      // Un arrêt tombé avant la création du container n'a rien pu tuer.
+      cancelled: () => aborted || timedOut,
     }).finally(() => {
       clearTimeout(timer);
       if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
