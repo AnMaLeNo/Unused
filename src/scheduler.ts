@@ -112,11 +112,16 @@ export async function runWindow(
         const resetsAt = r.outcome.kind === "quota" ? r.outcome.resetsAt : undefined;
         // Jusqu'au reset annoncé (plus une marge), sinon l'attente aveugle.
         const target = resetsAt !== undefined ? resetsAt * 1000 + 30_000 - nowMs : cfg.scheduler.backoffMinutes * 60_000;
-        const wait = Math.min(Math.max(target, 60_000), until().getTime() - nowMs);
+        const full = Math.max(target, 60_000);
+        const wait = Math.min(full, until().getTime() - nowMs);
         if (wait <= 0) break;
         const untilIso = new Date(nowMs + wait).toISOString();
-        deps.print(`  quota ${r.outcome.kind === "quota" ? r.outcome.reason : ""} saturé, reprise à ${untilIso} (${formatDuration(wait)})`);
-        deps.onEvent({ type: "backoff", ms: wait, until: untilIso });
+        const resetIso = new Date(nowMs + full).toISOString();
+        const quota = `quota ${r.outcome.kind === "quota" ? r.outcome.reason : ""}`;
+        // Reset après la fin de plage : rien ne reprendra, on ne l'annonce pas.
+        if (wait < full) deps.print(`  ${quota} saturé jusqu'à ${resetIso} : la plage se termine avant, à ${untilIso}`);
+        else deps.print(`  ${quota} saturé, reprise à ${untilIso} (${formatDuration(wait)})`);
+        deps.onEvent({ type: "backoff", ms: wait, until: resetIso });
         await deps.sleep(wait, signal);
         break;
       }
