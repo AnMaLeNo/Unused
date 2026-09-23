@@ -1,4 +1,4 @@
-import { unlink } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import { chmodSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -142,6 +142,8 @@ export function probe(sock: string): Promise<boolean> {
 
 /** Écoute sur le socket, après avoir écarté un socket périmé (ou refusé si un démon répond). */
 export async function listen(server: http.Server, sock: string): Promise<void> {
+  // Sur une installation neuve, data/ n'existe pas encore (il n'est pas versionné).
+  await mkdir(path.dirname(sock), { recursive: true });
   if (await probe(sock)) throw new Error(`un démon répond déjà sur ${sock}`);
   await unlink(sock).catch(() => {});
   await new Promise<void>((resolve, reject) => {
