@@ -173,8 +173,14 @@ export async function commitTask(cfg: Config, taskName: string, container: strin
     "commit du container",
   );
   await docker(["rm", container]);
-  if ((await layerCount(`${name}:latest`)) > cfg.docker.flattenAfterLayers) {
-    await flattenTask(taskName);
+  // Le commit est acquis : un aplatissement raté (disque plein…) ne doit pas
+  // le faire passer pour un échec. Il sera retenté au commit suivant.
+  try {
+    if ((await layerCount(`${name}:latest`)) > cfg.docker.flattenAfterLayers) {
+      await flattenTask(taskName);
+    }
+  } catch {
+    // :latest est intact (non aplati), rien à défaire.
   }
   await pruneTask(taskName);
 }
@@ -210,18 +216,25 @@ export function importChanges(config: ImageConfig): string[] {
   return changes;
 }
 
-/** Réécrit :latest en une image à une seule couche (export → import). */
+/**
+ * Réécrit :latest en une image à une seule couche (export → import). L'import
+ * va sous un tag provisoire : :latest n'est remplacé que si l'export et
+ * l'import ont tous deux réussi.
+ */
 export async function flattenTask(taskName: string): Promise<void> {
   const latest = `${taskImage(taskName)}:latest`;
+  const flat = `${taskImage(taskName)}:flat`;
   const inspect = await mustSucceed(["image", "inspect", "--format", "{{json .Config}}", latest], "inspect");
   const changes = importChanges(JSON.parse(inspect.stdout) as ImageConfig);
 
   const tmp = `unused-flatten-${taskName}-${Date.now()}`;
   await mustSucceed(["create", "--name", tmp, latest], "création du container d'export");
   try {
-    await pipeExportImport(tmp, latest, changes);
+    await pipeExportImport(tmp, flat, changes);
+    await mustSucceed(["tag", flat, latest], "remplacement de l'image aplatie");
   } finally {
     await docker(["rm", tmp]);
+    await docker(["rmi", flat]);
   }
 }
 
@@ -233,14 +246,28 @@ function pipeExportImport(container: string, image: string, changes: string[]): 
     importArgs.push("-", image);
     const imp = spawn("docker", importArgs, { stdio: ["pipe", "pipe", "pipe"] });
     exp.stdout.pipe(imp.stdin);
+    // Un import qui s'arrête avant la fin fait échouer l'écriture (EPIPE) :
+    // sans ce handler, l'erreur tuerait le démon. L'échec se lit dans les codes.
+    imp.stdin.on("error", () => {});
     const errs: Buffer[] = [];
     exp.stderr.on("data", (d: Buffer) => errs.push(d));
     imp.stderr.on("data", (d: Buffer) => errs.push(d));
-    let expCode: number | null = null;
-    exp.on("close", (c) => (expCode = c));
-    imp.on("close", (c) => {
-      if (c === 0 && (expCode === 0 || expCode === null)) resolve();
+    // Verdict une fois les DEUX processus terminés, et seulement si les deux ont réussi.
+    const codes: { exp?: number | null; imp?: number | null } = {};
+    const settle = (): void => {
+      if (!("exp" in codes) || !("imp" in codes)) return;
+      if (codes.exp === 0 && codes.imp === 0) resolve();
       else reject(new DockerError(`aplatissement a échoué :\n${Buffer.concat(errs).toString("utf8").trim()}`));
+    };
+    exp.on("close", (c) => {
+      codes.exp = c;
+      settle();
+    });
+    imp.on("close", (c) => {
+      codes.imp = c;
+      // Plus personne ne lit l'export : il resterait bloqué.
+      if (!("exp" in codes)) exp.kill();
+      settle();
     });
     exp.on("error", reject);
     imp.on("error", reject);
