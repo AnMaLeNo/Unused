@@ -49,6 +49,9 @@ export function classify(
   if (r?.api_error_status !== undefined && r.api_error_status !== null && AUTH_STATUSES.has(r.api_error_status)) {
     return { kind: "fatal", reason: "auth", detail: `HTTP ${r.api_error_status} : ${r.result ?? "authentification refusée"}` };
   }
+  // Un 429 est une limitation de débit, même sans événement `rejected` : on
+  // attend (backoffMinutes) au lieu de compter un échec contre la tâche.
+  if (r?.api_error_status === 429) return { kind: "quota", reason: "http_429" };
   return { kind: "failure", reason: r?.terminal_reason ?? "unreadable_output" };
 }
 
