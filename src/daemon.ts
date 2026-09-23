@@ -397,11 +397,22 @@ export class Daemon {
   async resetTask(name: string): Promise<{ start: string }> {
     const task = await this.findTask(name);
     if (this.running?.current?.task === name) throw new ConflictError(`${name} est en cours d'itération`);
+    // Pendant une plage, une tâche encore dans la file pourrait repartir au
+    // milieu du reset, sur son ancienne image : elle doit d'abord en sortir.
+    const ts = this.state.tasks[name];
+    if (this.running && task.def.active && (ts === undefined || ts.status === "running")) {
+      throw new ConflictError(`${name} est dans la file de la plage en cours : \`unused tasks deactivate ${name}\` ou \`unused stop\` d'abord`);
+    }
+    // Docker d'abord : si les images ne partent pas, rien n'est remis à zéro.
+    try {
+      await this.deps.removeTaskImages(name);
+    } catch (err) {
+      throw new ConflictError(`${(err as Error).message.split("\n")[0]} — rien n'a été remis à zéro`);
+    }
+    await rm(path.join(task.exchangeDir, DONE_FILE), { force: true });
     delete this.state.tasks[name];
     if (this.state.currentTask === name) this.state.currentTask = null;
     await saveState(this.cfg.dataDir, this.state);
-    await rm(path.join(task.exchangeDir, DONE_FILE), { force: true });
-    await this.deps.removeTaskImages(name);
     await this.unpause();
     return { start: task.def.start };
   }

@@ -249,6 +249,11 @@ function pipeExportImport(container: string, image: string, changes: string[]): 
 
 export async function removeTaskImages(taskName: string): Promise<void> {
   const name = taskImage(taskName);
-  await docker(["rmi", "-f", `${name}:latest`, `${name}:prev`]);
+  const r = await docker(["rmi", "-f", `${name}:latest`, `${name}:prev`]);
+  // Une image déjà absente n'est pas un échec ; le reste (Docker injoignable…) en est un.
+  const problems = r.stderr.split("\n").filter((l) => l.trim() && !/No such image/i.test(l));
+  if (r.code !== 0 && problems.length > 0) {
+    throw new DockerError(`images de ${taskName} non supprimées :\n${problems.join("\n")}`, r);
+  }
   await pruneTask(taskName);
 }
