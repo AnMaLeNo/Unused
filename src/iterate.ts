@@ -158,6 +158,7 @@ export async function iterate(
   else if (session.lines === 0 && isDockerDown(r.stderr)) outcome = { kind: "fatal", reason: "docker", detail: r.stderr.trim() };
   else outcome = classify(session, done);
 
+  const failuresBefore = ts.consecutiveFailures;
   // Un arrêt demandé ne compte ni comme échec ni comme quoi que ce soit.
   const decision: Decision = aborted
     ? "retry"
@@ -177,6 +178,8 @@ export async function iterate(
       ts.cursor = nodeName;
       ts.iterations -= 1;
       ts.status = "running";
+      ts.consecutiveFailures = failuresBefore;
+      if (ts.last) ts.last.outcome = "fatal:docker";
       await deps.discardContainer(r.container);
       await rm(donePath, { force: true });
       applyDecision(state, task, "stop-window");
