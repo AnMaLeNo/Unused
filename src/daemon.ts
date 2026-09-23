@@ -213,6 +213,9 @@ export class Daemon {
     } catch (err) {
       this.deps.print(`plage interrompue par une erreur : ${(err as Error).message}`);
       this.state.window = null;
+      // Écrit tout de suite : pauseUntil ne sauve pas quand il n'y a pas de
+      // calendrier, et la plage serait reprise au redémarrage.
+      await saveState(this.cfg.dataDir, this.state).catch(() => {});
       await this.pauseUntil(this.deadline(run.manualUntil), "erreur");
     } finally {
       if (run.explicitStop && this.state.window) {
