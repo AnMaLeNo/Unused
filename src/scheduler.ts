@@ -29,6 +29,9 @@ export interface SchedulerDeps {
   // Arrêt gracieux : vrai → on finit l'itération en cours et on s'arrête là.
   shouldStop: () => boolean;
   onEvent: (event: SchedulerEvent) => void;
+  // Vrai si des tâches n'ont pas pu être lues au dernier chargement : une file
+  // vide ne veut alors pas dire « plus rien à faire ».
+  tasksUnreadable?: () => boolean;
 }
 
 export function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -80,12 +83,21 @@ export async function runWindow(
   deps.print(`plage jusqu'à ${until().toISOString()} (${formatDuration(until().getTime() - startedAt.getTime())})`);
 
   let stopped = false;
+  let unreadableNoted = false;
   while (!signal.aborted && deps.now() < until()) {
     if (deps.shouldStop()) {
       stopped = true;
       break;
     }
     const task = pickNext(await loadTasks(), state);
+    if (!task && deps.tasksUnreadable?.()) {
+      // Sans doute un task.json en cours d'édition : on relit un peu plus tard.
+      if (!unreadableNoted) deps.print("aucune tâche éligible, mais des tâches sont illisibles : nouvel essai régulier");
+      unreadableNoted = true;
+      const wait = Math.min(Math.max(cfg.scheduler.retrySeconds * 1000, 10_000), until().getTime() - deps.now().getTime());
+      if (wait > 0) await deps.sleep(wait, signal);
+      continue;
+    }
     if (!task) {
       summary.endedBecause = "nothing-eligible";
       deps.print("plus aucune tâche éligible");
