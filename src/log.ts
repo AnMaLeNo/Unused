@@ -43,7 +43,8 @@ export async function writeIterationLog(cfg: Config, rec: IterationRecord): Prom
   const dir = path.join(logsDir(cfg), rec.task);
   await mkdir(dir, { recursive: true });
   const stamp = rec.startedAt.replace(/[:.]/g, "-");
-  const file = path.join(dir, `${stamp}-${rec.node}.json`);
+  // Le nom du nœud est libre dans task.json : un « / » en ferait un chemin.
+  const file = path.join(dir, `${stamp}-${rec.node.replace(/[^\w.-]/g, "_")}.json`);
   await writeFile(file, JSON.stringify(rec, null, 2) + "\n", "utf8");
 
   const line = {
