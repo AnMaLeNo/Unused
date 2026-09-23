@@ -57,10 +57,13 @@ async function exists(p: string): Promise<boolean> {
 }
 
 const DOCKER_DOWN = /Cannot connect to the Docker daemon|docker daemon is not running|error during connect|permission denied while trying to connect to the Docker daemon/i;
+// Image absente (base jamais construite, `docker image prune -a`, nouvelle
+// machine) : aucune tâche ne peut tourner non plus, ce n'est pas leur faute.
+const IMAGE_MISSING = /Unable to find image|pull access denied|No such image/i;
 
-/** Le démon Docker est-il injoignable, d'après ce que `docker run` a dit ? */
+/** Docker est-il inutilisable (démon injoignable, image absente), d'après ce que `docker run` a dit ? */
 export function isDockerDown(stderr: string): boolean {
-  return DOCKER_DOWN.test(stderr);
+  return DOCKER_DOWN.test(stderr) || IMAGE_MISSING.test(stderr);
 }
 
 /**
