@@ -101,9 +101,10 @@ export class Daemon {
         this.manual = { until, resumed: true };
         this.deps.print(`plage interrompue trouvée, reprise jusqu'à ${until.toISOString()}`);
       } else {
+        // Oubliée en mémoire seulement : init tourne avant que le socket ne
+        // garantisse qu'on est seul, un second démon ne doit rien écrire.
         this.deps.print("plage enregistrée expirée, oubliée");
         this.state.window = null;
-        await saveState(this.cfg.dataDir, this.state);
       }
     }
     if (this.cfg.windows.length > 0) {

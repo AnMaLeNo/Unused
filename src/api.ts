@@ -124,17 +124,23 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
   });
 }
 
-/** Un démon écoute-t-il déjà sur ce socket ? */
+// Personne n'écoute : pas de fichier, un fichier qui n'est pas un socket, ou un socket abandonné.
+const STALE = new Set(["ENOENT", "ENOTSOCK", "ECONNREFUSED"]);
+
+/**
+ * Un démon écoute-t-il déjà sur ce socket ? Seul un socket où personne
+ * n'écoute est périmé : un démon occupé qui tarde à répondre est bien là.
+ */
 export function probe(sock: string): Promise<boolean> {
   return new Promise((resolve) => {
     const req = http.request({ socketPath: sock, path: "/status", method: "GET", timeout: 2000 }, (res) => {
       res.resume();
       resolve(true);
     });
-    req.on("error", () => resolve(false));
+    req.on("error", (e: NodeJS.ErrnoException) => resolve(!STALE.has(e.code ?? "")));
     req.on("timeout", () => {
+      resolve(true);
       req.destroy();
-      resolve(false);
     });
     req.end();
   });
