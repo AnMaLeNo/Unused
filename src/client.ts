@@ -57,16 +57,25 @@ export function stream(sock: string, method: string, path: string, onLine: (line
   return new Promise((resolve, reject) => {
     const req = http.request({ socketPath: sock, method, path }, (res) => {
       let buf = "";
+      // Une route streamée a déjà répondu 200 quand elle échoue : l'échec arrive
+      // en fin de flux, à partir d'une ligne « ERREUR … ».
+      let failure: string[] | null = null;
+      const line = (l: string): void => {
+        if (failure === null && l.startsWith("ERREUR ")) failure = [l.slice("ERREUR ".length)];
+        else if (failure !== null) failure.push(l);
+        else onLine(l);
+      };
       res.setEncoding("utf8");
       res.on("data", (chunk: string) => {
         buf += chunk;
         const lines = buf.split("\n");
         buf = lines.pop() ?? "";
-        for (const l of lines) onLine(l);
+        for (const l of lines) line(l);
       });
       res.on("end", () => {
-        if (buf) onLine(buf);
+        if (buf) line(buf);
         if ((res.statusCode ?? 500) >= 300) return reject(new ApiError(res.statusCode ?? 0, buf || `HTTP ${res.statusCode}`));
+        if (failure !== null) return reject(new ApiError(500, failure.join("\n").trim()));
         resolve();
       });
     });
