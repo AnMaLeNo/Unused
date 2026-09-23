@@ -1,13 +1,15 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { coverageEnd, nextStart } from "./calendar.js";
 import type { Config } from "./config.js";
 import { formatDuration } from "./duration.js";
-import { dockerVersion, imageExists, removeTaskImages } from "./docker.js";
+import { dockerVersion, imageExists, removeTaskImages, taskImage } from "./docker.js";
 import { DONE_FILE } from "./iterate.js";
 import { runWindow, type SchedulerEvent, type WindowSummary } from "./scheduler.js";
 import { ensureTaskState, loadState, saveState, type RunnerState, type TaskState } from "./state.js";
-import { loadTasks, TASK_FILE, type Task, type TaskLoadError } from "./task.js";
+import { loadTasks, TASK_FILE, TASK_NAME_RE, type Task, type TaskLoadError } from "./task.js";
+import { scaffoldTask } from "./scaffold.js";
 
 export class ConflictError extends Error {}
 export class NotFoundError extends Error {}
@@ -370,6 +372,24 @@ export class Daemon {
       tasks: tasks.map((t) => this.taskInfo(t)),
       taskErrors: errors,
     };
+  }
+
+  /**
+   * Crée le squelette d'une tâche. Le nom est sa seule identité : s'il a déjà
+   * servi à une tâche supprimée depuis, l'état et l'image de celle-ci sont
+   * effacés, sinon la tâche neuve hériterait de son travail.
+   */
+  async newTask(name: string): Promise<string> {
+    const dir = path.join(this.cfg.tasksDir, name);
+    if (TASK_NAME_RE.test(name) && !existsSync(dir)) {
+      if (await this.deps.imageExists(`${taskImage(name)}:latest`)) await this.deps.removeTaskImages(name);
+      if (this.state.tasks[name] || this.state.currentTask === name) {
+        delete this.state.tasks[name];
+        if (this.state.currentTask === name) this.state.currentTask = null;
+        await saveState(this.cfg.dataDir, this.state);
+      }
+    }
+    return scaffoldTask(this.cfg.tasksDir, name);
   }
 
   private taskInfo(task: Task): TaskInfo {
