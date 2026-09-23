@@ -186,7 +186,11 @@ export async function iterate(
     await rm(donePath, { force: true });
   }
   const finalDecision: Decision = outcome.kind === "fatal" ? "stop-window" : decision;
-  if (!aborted) await saveState(cfg.dataDir, state);
+  if (!aborted) {
+    // Le travail est commité : une sauvegarde ratée (disque plein…) ne doit pas
+    // arrêter la plage ; l'état en mémoire est juste et sera réécrit ensuite.
+    await saveState(cfg.dataDir, state).catch((err: Error) => print(`état non sauvé : ${err.message}`));
+  }
 
   const model = typeof session.init?.model === "string" ? session.init.model : Object.keys(session.result?.modelUsage ?? {})[0];
   const rec: IterationRecord = {
@@ -214,7 +218,11 @@ export async function iterate(
     decision: finalDecision,
     committed,
   };
-  const logFile = await writeIterationLog(cfg, rec);
+  // Un journal qui ne peut pas être écrit ne doit pas effacer l'itération qu'il décrit.
+  const logFile = await writeIterationLog(cfg, rec).catch((err: Error) => {
+    print(`journal non écrit : ${err.message}`);
+    return null;
+  });
 
   const label = outcome.kind === "completed" ? "completed" : outcome.kind === "fatal" ? `fatal:${outcome.reason}` : outcome.reason;
   print(`fin      ${endedAt.toISOString()} (${Math.round(rec.durationMs / 1000)}s, code ${r.code})`);
@@ -226,7 +234,7 @@ export async function iterate(
   if (outcome.kind === "fatal") print(`panne    ${outcome.detail.split("\n")[0]}`);
   if (session.result === null && r.stderr.trim()) print(`stderr   ${r.stderr.trim().split("\n").slice(-3).join("\n         ")}`);
   print(`curseur  ${ts.cursor}`);
-  print(`log      ${logFile}`);
+  print(`log      ${logFile ?? "(non écrit)"}`);
   return { node: nodeName, outcome, decision: finalDecision, logFile, costUsd: session.result?.total_cost_usd, quotaAfter };
 
   function finishFatal(reason: "auth" | "docker", detail: string): IterateResult {
