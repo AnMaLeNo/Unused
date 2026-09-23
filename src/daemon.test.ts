@@ -23,6 +23,8 @@ let seen: { until: Date; deps: Partial<SchedulerDeps> }[] = [];
 const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, state, deadline, signal, deps = {}) => {
   const until = typeof deadline === "function" ? deadline() : deadline;
   seen.push({ until, deps });
+  // Une itération tourne : un stop gracieux attend sa fin.
+  deps.onEvent?.({ type: "iteration-start", task: "t1", node: "a", at: new Date().toISOString() });
   state.window = { startedAt: new Date().toISOString(), until: until.toISOString() };
   await saveState(cfg.dataDir, state);
   await new Promise<void>((resolve) => {

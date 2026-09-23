@@ -123,7 +123,9 @@ export class Daemon {
   private calendarEnd(now: Date): Date | null {
     if (this.fatal) return null;
     const paused = this.state.pausedUntil ? new Date(this.state.pausedUntil) : null;
-    if (paused && paused.getTime() > now.getTime()) return null;
+    // La pause posée par un stop ne vaut qu'une fois la plage arrêtée : pendant
+    // sa dernière itération, la plage garde sa source et sa fin.
+    if (paused && paused.getTime() > now.getTime() && !this.running?.explicitStop) return null;
     return coverageEnd(this.cfg.windows, now);
   }
 
@@ -314,10 +316,19 @@ export class Daemon {
       throw new ConflictError("aucune plage en cours");
     }
     const run = this.running;
-    this.state.pausedUntil = this.deadline(run.manualUntil).toISOString();
+    const until = this.deadline(run.manualUntil);
+    // Sans calendrier, il n'y a rien à mettre en pause (même règle que pauseUntil).
+    if (this.cfg.windows.length > 0 && until.getTime() > this.deps.now().getTime()) {
+      this.state.pausedUntil = until.toISOString();
+    }
+    // Oubliée dès maintenant : un arrêt brutal avant la fin de l'itération en
+    // cours ne doit pas faire reprendre la plage au redémarrage.
+    this.state.window = null;
     await saveState(this.cfg.dataDir, this.state);
     run.explicitStop = true;
-    if (now) {
+    // Aucune itération en cours (attente quota, pause entre deux itérations) :
+    // il n'y a rien à finir, on arrête tout de suite.
+    if (now || run.current === null) {
       run.ac.abort();
       return { stopping: "now" };
     }
