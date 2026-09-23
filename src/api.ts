@@ -7,7 +7,6 @@ import { ConflictError, NotFoundError, type Daemon } from "./daemon.js";
 import { buildBase } from "./docker.js";
 import { dockerCheck } from "./dockerCheck.js";
 import { parseDuration } from "./duration.js";
-import { scaffoldTask } from "./scaffold.js";
 
 export const SOCKET_FILE = "unused.sock";
 
@@ -73,7 +72,7 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
         const body = await readJson(req);
         if (typeof body.name !== "string") throw new HttpError(400, "champ `name` attendu");
         try {
-          return sendJson(res, 200, { dir: await scaffoldTask(cfg.tasksDir, body.name) });
+          return sendJson(res, 200, { dir: await daemon.newTask(body.name) });
         } catch (err) {
           throw new HttpError(409, (err as Error).message);
         }
