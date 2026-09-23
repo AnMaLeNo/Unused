@@ -11,8 +11,9 @@ export type Day = (typeof DAYS)[number];
 export const WindowSpecSchema = z
   .object({
     days: z.array(z.enum(DAYS)).nonempty(),
-    from: z.string().regex(/^\d{2}:\d{2}$/, "heure attendue au format HH:MM"),
-    to: z.string().regex(/^\d{2}:\d{2}$/, "heure attendue au format HH:MM"),
+    from: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "heure attendue entre 00:00 et 23:59"),
+    // 24:00 : jusqu'à minuit pile.
+    to: z.string().regex(/^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$/, "heure attendue entre 00:00 et 24:00"),
   })
   .strict();
 export type WindowSpec = z.infer<typeof WindowSpecSchema>;
@@ -27,6 +28,11 @@ function at(day: Date, hhmm: string): Date {
   const d = new Date(day);
   d.setHours(h, m, 0, 0);
   return d;
+}
+
+function minutes(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map(Number) as [number, number];
+  return h * 60 + m;
 }
 
 function addDays(d: Date, n: number): Date {
@@ -45,9 +51,11 @@ export function occurrences(specs: WindowSpec[], now: Date): Span[] {
     for (const spec of specs) {
       if (!spec.days.includes(name)) continue;
       const start = at(day, spec.from);
-      let end = at(day, spec.to);
-      if (end.getTime() <= start.getTime()) end = addDays(end, 1);
-      spans.push({ start, end });
+      // Passe minuit si la fin est au plus le début, en heures d'horloge : le
+      // jour d'un changement d'heure, comparer les instants se trompe.
+      const end = minutes(spec.to) <= minutes(spec.from) ? at(addDays(day, 1), spec.to) : at(day, spec.to);
+      // Vide si la plage tombe dans l'heure sautée au passage à l'heure d'été.
+      if (end.getTime() > start.getTime()) spans.push({ start, end });
     }
   }
   return spans.sort((a, b) => a.start.getTime() - b.start.getTime());
@@ -62,7 +70,8 @@ export function coverageEnd(specs: WindowSpec[], now: Date): Date | null {
   for (const s of occurrences(specs, now)) {
     const inside = s.start.getTime() <= now.getTime() && now.getTime() < s.end.getTime();
     const extends_ = end !== null && s.start.getTime() <= end.getTime() && s.end.getTime() > end.getTime();
-    if (inside || extends_) end = s.end;
+    // Une plage incluse dans une autre ne raccourcit pas la couverture.
+    if (inside || extends_) end = end === null || s.end.getTime() > end.getTime() ? s.end : end;
   }
   return end;
 }
