@@ -104,9 +104,13 @@ export async function dockerCheck(cfg: Config, opts: { rebuild: boolean }, print
     print("\nTout est en ordre.");
   } finally {
     step("Nettoyage");
-    await removeTaskImages(CHECK_TASK);
     await docker(["container", "prune", "-f", "--filter", `label=unused.task=${CHECK_TASK}`]);
     await rm(exchangeDir, { recursive: true, force: true });
-    ok(`images et containers de ${CHECK_TASK} supprimés`);
+    try {
+      await removeTaskImages(CHECK_TASK);
+      ok(`images et containers de ${CHECK_TASK} supprimés`);
+    } catch (err) {
+      print(`  ✘ nettoyage incomplet, ${(err as Error).message.split("\n")[0]}`);
+    }
   }
 }
