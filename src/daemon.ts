@@ -131,6 +131,9 @@ export class Daemon {
     const now = this.deps.now();
     const paused = this.state.pausedUntil ? new Date(this.state.pausedUntil) : null;
     const from = paused && paused.getTime() > now.getTime() ? paused : now;
+    // Une pause qui s'achève en pleine plage automatique : on reprend dès la
+    // fin de la pause, pas à la plage suivante.
+    if (from === paused && coverageEnd(this.cfg.windows, paused) !== null) return paused;
     return nextStart(this.cfg.windows, from);
   }
 
