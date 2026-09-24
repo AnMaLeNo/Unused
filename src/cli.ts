@@ -44,8 +44,9 @@ program
     const server = createApi(cfg, daemon);
     const sock = socketPath(cfg);
     await listen(server, sock);
-    // Seul démon désormais (listen l'a vérifié) : un container encore là vient
-    // d'un démon tué en pleine itération, il consommerait le quota pour rien.
+    // Seul démon sur ce socket (listen l'a vérifié), et on n'en fait tourner
+    // qu'un par hôte Docker : un container encore là vient donc d'un démon tué
+    // en pleine itération, il consommerait le quota pour rien.
     const orphans = await removeOrphanContainers().catch(() => 0);
     if (orphans > 0) log(`${orphans} container(s) laissé(s) par un arrêt brutal, supprimé(s)`);
     log(`démon prêt, socket ${sock}`);
