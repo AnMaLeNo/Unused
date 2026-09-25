@@ -165,6 +165,19 @@ export async function discardContainer(container: string): Promise<void> {
   await docker(["rm", "-f", container]);
 }
 
+/**
+ * Supprime les containers de tâches encore présents. À n'appeler qu'au
+ * démarrage du démon : rien ne tourne encore, tout ce qui reste vient d'un
+ * démon tué sans avoir pu arrêter son itération (SIGKILL, coupure).
+ */
+export async function removeOrphanContainers(): Promise<number> {
+  const r = await docker(["ps", "-aq", "--filter", `label=${LABEL}`]);
+  const ids = r.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (r.code !== 0 || ids.length === 0) return 0;
+  await docker(["rm", "-f", ...ids]);
+  return ids.length;
+}
+
 export async function layerCount(image: string): Promise<number> {
   const r = await mustSucceed(["image", "inspect", "--format", "{{len .RootFS.Layers}}", image], "inspect");
   return Number(r.stdout.trim());

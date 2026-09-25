@@ -6,6 +6,7 @@ import { createApi, listen, socketPath } from "./api.js";
 import { ApiError, call, DaemonUnreachable, stream } from "./client.js";
 import { CONFIG_FILE, loadConfig, type Config } from "./config.js";
 import { Daemon, type DaemonStatus } from "./daemon.js";
+import { removeOrphanContainers } from "./docker.js";
 import { formatDuration } from "./duration.js";
 
 const program = new Command()
@@ -43,6 +44,11 @@ program
     const server = createApi(cfg, daemon);
     const sock = socketPath(cfg);
     await listen(server, sock);
+    // Seul démon sur ce socket (listen l'a vérifié), et on n'en fait tourner
+    // qu'un par hôte Docker : un container encore là vient donc d'un démon tué
+    // en pleine itération, il consommerait le quota pour rien.
+    const orphans = await removeOrphanContainers().catch(() => 0);
+    if (orphans > 0) log(`${orphans} container(s) laissé(s) par un arrêt brutal, supprimé(s)`);
     log(`démon prêt, socket ${sock}`);
 
     const ac = new AbortController();

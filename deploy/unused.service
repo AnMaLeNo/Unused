@@ -21,6 +21,9 @@ RestartSec=5
 # le reste du cgroup n'est frappé qu'après TimeoutStopSec.
 KillMode=mixed
 TimeoutStopSec=60
+# Filet de sécurité : un démon tué (SIGKILL après TimeoutStopSec, crash) laisse
+# son container tourner ; on le supprime ici, même si le démon ne redémarre pas.
+ExecStopPost=-/bin/sh -c 'docker ps -aq --filter label=unused.task | xargs -r docker rm -f'
 
 [Install]
 WantedBy=multi-user.target
