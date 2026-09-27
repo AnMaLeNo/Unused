@@ -102,7 +102,7 @@ function stopOutcome(r: StopResult, other: string): string {
 
 program
   .command("stop")
-  .description("retire la plage manuelle (--auto : coupe les plages automatiques jusqu'à `resume`) ; le travail continue si l'autre source couvre encore")
+  .description("retire la plage manuelle (--auto : coupe les plages automatiques jusqu'à `resume`) ; n'arrête rien si l'autre source couvre encore")
   .option("--auto", "coupe les plages automatiques au lieu de la plage manuelle", false)
   .option("--now", "si plus rien ne couvre, tue l'itération en cours (s'il y en a une) au lieu d'attendre sa fin", false)
   .action(async (opts: { auto: boolean; now: boolean }) => {
