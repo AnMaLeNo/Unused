@@ -260,4 +260,11 @@ describe("daemon + api", () => {
     expect((await status()).window).toBeNull();
     await shutdown();
   });
+
+  it("premier démarrage : data/ absent est créé avec le socket", async () => {
+    await rm(cfg.dataDir, { recursive: true, force: true });
+    await boot();
+    expect((await status()).window).toBeNull();
+    await shutdown();
+  });
 });
