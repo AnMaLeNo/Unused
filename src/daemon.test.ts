@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApi, listen, socketPath } from "./api.js";
 import { ApiError, call } from "./client.js";
 import type { Config } from "./config.js";
-import { Daemon, type DaemonStatus } from "./daemon.js";
+import { Daemon, isTaskChange, type DaemonStatus, type StopResult } from "./daemon.js";
 import type { runWindow, SchedulerDeps, WindowSummary } from "./scheduler.js";
 import { emptyState, saveState, type RunnerState } from "./state.js";
+import type { WindowSpec } from "./calendar.js";
 
 let root: string;
 let cfg: Config;
@@ -20,11 +21,10 @@ let loop: Promise<void>;
 // Scheduler factice : tourne jusqu'à abort, shouldStop, ou `until` simulé par `finish()`.
 let finish: (() => void) | null = null;
 let seen: { until: Date; deps: Partial<SchedulerDeps> }[] = [];
-const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, state, deadline, signal, deps = {}) => {
+const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, _state, deadline, signal, deps = {}) => {
   const until = typeof deadline === "function" ? deadline() : deadline;
   seen.push({ until, deps });
-  state.window = { startedAt: new Date().toISOString(), until: until.toISOString() };
-  await saveState(cfg.dataDir, state);
+  deps.onEvent?.({ type: "iteration-start", task: "t1", node: "a", at: new Date().toISOString() });
   await new Promise<void>((resolve) => {
     finish = resolve;
     signal.addEventListener("abort", () => resolve());
@@ -37,16 +37,25 @@ const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, state, deadline, si
     signal.addEventListener("abort", () => clearInterval(poll));
   });
   const summary: WindowSummary = { iterations: 1, completed: 1, failures: 0, backoffs: 0, costUsd: 0.1, endedBecause: signal.aborted ? "stopped" : "window" };
-  if (!signal.aborted) {
-    state.window = null;
-    await saveState(cfg.dataDir, state);
-  }
   return summary;
 };
 
-async function boot(initial?: RunnerState): Promise<void> {
+/** Une plage automatique qui couvre l'instant : commencée il y a une minute, finit dans `hours` heures. */
+function coveringWindow(hours: number): { spec: WindowSpec; end: Date } {
+  const now = new Date();
+  const hhmm = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const days = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+  const start = new Date(now.getTime() - 60_000);
+  const end = new Date(now.getTime() + hours * 3_600_000);
+  return { spec: { days: [days[start.getDay()]!], from: hhmm(start), to: hhmm(end) }, end };
+}
+
+const near = (iso: string | null | undefined, d: Date) => Math.abs(new Date(iso ?? 0).getTime() - d.getTime()) < 60_000;
+const savedState = async () => JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")) as RunnerState;
+
+async function boot(initial?: RunnerState, print: (line: string) => void = () => {}): Promise<void> {
   if (initial) await saveState(cfg.dataDir, initial);
-  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x" });
+  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x", print });
   await daemon.init();
   server = createApi(cfg, daemon);
   await listen(server, sock);
@@ -86,6 +95,17 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
+describe("isTaskChange", () => {
+  it("réveille pour un dossier de tâche ou un task.json, pas pour exchange/ ni les skills", () => {
+    expect(isTaskChange("t2")).toBe(true);
+    expect(isTaskChange(path.join("t1", "task.json"))).toBe(true);
+    expect(isTaskChange(null)).toBe(true);
+    expect(isTaskChange(path.join("t1", "exchange"))).toBe(false);
+    expect(isTaskChange(path.join("t1", "exchange", "DONE"))).toBe(false);
+    expect(isTaskChange(path.join("t1", "skills", "a", "SKILL.md"))).toBe(false);
+  });
+});
+
 describe("daemon + api", () => {
   it("au repos : status, tasks", async () => {
     await boot();
@@ -104,11 +124,12 @@ describe("daemon + api", () => {
     expect(seen).toHaveLength(1);
     await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409 } satisfies Partial<ApiError>);
 
-    const st = await call<{ stopping: string }>(sock, "DELETE", "/window");
-    expect(st.stopping).toBe("after-iteration");
+    const st = await call<StopResult>(sock, "DELETE", "/window");
+    expect(st).toMatchObject({ until: r.until, continuing: null, iteration: "t1", idle: false, stopping: "after-iteration", killed: false });
     await tick();
     expect((await status()).window).toBeNull();
-    expect(JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")).window).toBeNull();
+    expect((await status()).manual).toBeNull();
+    expect((await savedState()).window).toBeNull();
     await expect(call(sock, "DELETE", "/window")).rejects.toMatchObject({ status: 409 });
     await shutdown();
   });
@@ -117,18 +138,20 @@ describe("daemon + api", () => {
     await boot();
     await call(sock, "POST", "/window", { for: "1h" });
     await tick();
-    expect((await call<{ stopping: string }>(sock, "DELETE", "/window?now=1")).stopping).toBe("now");
+    expect(await call<StopResult>(sock, "DELETE", "/window?now=1")).toMatchObject({ iteration: "t1", stopping: "now", killed: true });
     await tick();
     expect((await status()).window).toBeNull();
-    expect(JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")).window).toBeNull();
+    expect((await savedState()).window).toBeNull();
     await shutdown();
   });
 
   it("arrêt du service (SIGTERM) : la plage reste enregistrée et est reprise au démarrage suivant", async () => {
-    await boot();
+    const lines: string[] = [];
+    await boot(undefined, (l) => lines.push(l));
     await call(sock, "POST", "/window", { for: "1h" });
     await tick();
     await shutdown();
+    expect(lines.filter((l) => /jetée|reprise au prochain/.test(l))).toEqual(["itération de t1 jetée", expect.stringMatching(/^plage manuelle jusqu'à .* : reprise au prochain démarrage$/)]);
     const saved = JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")) as RunnerState;
     expect(saved.window).not.toBeNull();
 
@@ -165,77 +188,338 @@ describe("daemon + api", () => {
     server.close();
   });
 
-  it("plage automatique : démarre seule, stop la met en pause jusqu'à sa fin", async () => {
-    const now = new Date();
-    const hhmm = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-    const days = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
-    const start = new Date(now.getTime() - 60_000);
-    const end = new Date(now.getTime() + 2 * 3_600_000);
-    cfg.windows = [{ days: [days[start.getDay()]!], from: hhmm(start), to: hhmm(end) }];
+  it("plage automatique : démarre seule ; stop --auto la coupe (persisté) ; resume la rallume", async () => {
+    const { spec, end } = coveringWindow(2);
+    cfg.windows = [spec];
     await boot();
     await tick();
     const s1 = await status();
     expect(s1.window?.source).toBe("calendar");
+    expect(s1.manual).toBeNull();
+    expect(near(s1.auto.coveringUntil, end)).toBe(true);
     expect(seen).toHaveLength(1);
-    expect(Math.abs(seen[0]!.until.getTime() - end.getTime())).toBeLessThan(60_000);
+    expect(near(seen[0]!.until.toISOString(), end)).toBe(true);
 
-    await call(sock, "DELETE", "/window");
+    const st = await call<StopResult>(sock, "DELETE", "/auto");
+    expect(st).toMatchObject({ continuing: null, stopping: "after-iteration" });
+    expect(near(st.until, end)).toBe(true);
     await tick();
     const s2 = await status();
     expect(s2.window).toBeNull();
-    expect(s2.pausedUntil).not.toBeNull();
+    expect(s2.auto).toMatchObject({ enabled: false, windows: 1, coveringUntil: null, nextStart: null });
+    expect((await savedState()).autoEnabled).toBe(false);
     expect(seen).toHaveLength(1);
-    // Un start manuel lève la pause.
-    await call(sock, "POST", "/window", { for: "1h" });
+
+    const rs = await call<{ coveringUntil: string | null; nextStart: string | null }>(sock, "POST", "/auto");
+    expect(near(rs.coveringUntil, end)).toBe(true);
     await tick();
-    expect((await status()).window?.source).toBe("manual+calendar");
+    expect((await status()).window?.source).toBe("calendar");
+    expect((await savedState()).autoEnabled).toBe(true);
+    expect(seen).toHaveLength(2);
     await shutdown();
   });
 
-  it("plage automatique sans rien à faire : pause, levée par un reset", async () => {
-    const now = new Date();
-    const hhmm = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-    const days = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
-    const start = new Date(now.getTime() - 60_000);
-    const end = new Date(now.getTime() + 2 * 3_600_000);
-    cfg.windows = [{ days: [days[start.getDay()]!], from: hhmm(start), to: hhmm(end) }];
-    let calls = 0;
-    const idleRun: typeof runWindow = async (_c, _t, state) => {
-      calls += 1;
-      state.window = null;
-      return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "nothing-eligible" };
-    };
-    daemon = new Daemon(cfg, { runWindow: idleRun, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x" });
-    await daemon.init();
-    server = createApi(cfg, daemon);
-    await listen(server, sock);
-    ac = new AbortController();
-    loop = daemon.run(ac.signal);
+  it("plages automatiques coupées : le calendrier ne démarre pas, mais un start manuel travaille (source manual)", async () => {
+    const { spec } = coveringWindow(2);
+    cfg.windows = [spec];
+    const st = emptyState();
+    st.autoEnabled = false;
+    await boot(st);
     await tick();
-    expect(calls).toBe(1);
-    expect((await status()).pausedUntil).not.toBeNull();
-    await call(sock, "POST", "/tasks/t1/reset");
-    await tick();
-    expect(calls).toBe(2);
-    await shutdown();
-  });
+    expect(seen).toHaveLength(0);
+    expect((await status()).window).toBeNull();
 
-  it("panne globale : plus rien ne tourne jusqu'à un start", async () => {
-    const fatalRun: typeof runWindow = async (_c, _t, state, _d, _s, _deps) => {
-      state.window = { startedAt: "x", until: new Date(Date.now() + 3_600_000).toISOString() };
-      return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "fatal", fatal: { reason: "auth", detail: "401" } };
-    };
-    daemon = new Daemon(cfg, { runWindow: fatalRun, imageExists: async () => true, dockerVersion: async () => "x" });
-    await daemon.init();
-    server = createApi(cfg, daemon);
-    await listen(server, sock);
-    ac = new AbortController();
-    loop = daemon.run(ac.signal);
-    await call(sock, "POST", "/window", { for: "1h" });
+    const r = await call<{ until: string; coveredUntil: string }>(sock, "POST", "/window", { for: "1h" });
+    expect(r.coveredUntil).toBe(r.until);
     await tick();
     const s = await status();
-    expect(s.fatal).toMatchObject({ reason: "auth" });
+    expect(s.window?.source).toBe("manual");
+    expect(s.window?.until).toBe(r.until);
+    expect(s.auto.enabled).toBe(false);
+    await shutdown();
+  });
+
+  it("chevauchement : stop de la plage manuelle pendant une plage automatique → le travail continue (calendar)", async () => {
+    const { spec, end } = coveringWindow(2);
+    cfg.windows = [spec];
+    await boot();
+    await tick();
+    expect((await status()).window?.source).toBe("calendar");
+
+    // start pendant la plage automatique : la couverture s'étend, sans nouvelle plage.
+    const r = await call<{ until: string; coveredUntil: string }>(sock, "POST", "/window", { for: "3h" });
+    expect(r.coveredUntil).toBe(r.until);
+    await tick();
+    const s1 = await status();
+    expect(s1.window?.source).toBe("manual+calendar");
+    expect(s1.window?.until).toBe(r.until);
+    expect(s1.manual?.until).toBe(r.until);
+    expect(seen).toHaveLength(1);
+
+    const st = await call<StopResult>(sock, "DELETE", "/window?now=1");
+    expect(st).toMatchObject({ until: r.until, iteration: "t1", idle: false, stopping: null, killed: false });
+    expect(near(st.continuing, end)).toBe(true);
+    await tick();
+    const s2 = await status();
+    expect(s2.window?.source).toBe("calendar");
+    expect(near(s2.window?.until, end)).toBe(true);
+    expect(s2.manual).toBeNull();
+    expect((await savedState()).window).toBeNull();
+    expect(seen).toHaveLength(1);
+    await shutdown();
+  });
+
+  it("chevauchement inverse : stop --auto pendant une plage manuelle → le travail continue (manual) ; resume recolle", async () => {
+    const { spec, end } = coveringWindow(2);
+    cfg.windows = [spec];
+    await boot();
+    const r = await call<{ until: string; coveredUntil: string }>(sock, "POST", "/window", { for: "1h" });
+    expect(near(r.coveredUntil, end)).toBe(true);
+    await tick();
+    expect((await status()).window?.source).toBe("manual+calendar");
+
+    const st = await call<StopResult>(sock, "DELETE", "/auto");
+    expect(st).toMatchObject({ continuing: r.until, stopping: null });
+    await tick();
+    const s = await status();
+    expect(s.window?.source).toBe("manual");
+    expect(s.window?.until).toBe(r.until);
+    expect(s.auto.enabled).toBe(false);
+    expect(seen).toHaveLength(1);
+
+    await call(sock, "POST", "/auto");
+    await tick();
+    expect((await status()).window?.source).toBe("manual+calendar");
+    expect(seen).toHaveLength(1);
+    await shutdown();
+  });
+
+  it("stop --auto au repos : rien ne tourne, le calendrier ne réveillera pas ; stop manuel au repos → 409", async () => {
+    await boot();
+    const st = await call<StopResult>(sock, "DELETE", "/auto");
+    expect(st).toMatchObject({ until: null, continuing: null, iteration: null, idle: false, stopping: "now", killed: false });
+    expect((await status()).auto.enabled).toBe(false);
+    await expect(call(sock, "DELETE", "/window")).rejects.toMatchObject({ status: 409, message: /aucune plage manuelle/ });
+    await shutdown();
+  });
+
+  /** Passe `active` de t1 directement dans son task.json, sans passer par le démon. */
+  async function setActiveByHand(active: boolean): Promise<void> {
+    const file = path.join(cfg.tasksDir, "t1", "task.json");
+    const def = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    await writeFile(file, JSON.stringify({ ...def, active }));
+  }
+
+  async function until(cond: () => boolean | Promise<boolean>): Promise<void> {
+    for (let i = 0; i < 100 && !(await cond()); i++) await tick();
+  }
+
+  it("plage sans tâche à faire : rien ne tourne ; une tâche réactivée à la main est prise pendant la plage", async () => {
+    await setActiveByHand(false);
+    await boot();
+    const r = await call<{ until: string }>(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    const s = await status();
+    expect(seen).toHaveLength(0);
     expect(s.window).toBeNull();
+    expect(s.idle).toBe(true);
+    expect(s.manual?.until).toBe(r.until);
+
+    await setActiveByHand(true);
+    await until(() => seen.length > 0);
+    expect(seen).toHaveLength(1);
+    const s2 = await status();
+    expect(s2.idle).toBe(false);
+    expect(s2.window?.source).toBe("manual");
+    await shutdown();
+  });
+
+  it("plage sans tâche à faire : un dossier de tâche ajouté à la main est pris", async () => {
+    await setActiveByHand(false);
+    await boot();
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).idle);
+    expect(seen).toHaveLength(0);
+
+    // Les écritures d'un container dans exchange/ ne réveillent pas.
+    await mkdir(path.join(cfg.tasksDir, "t1", "exchange"), { recursive: true });
+    await writeFile(path.join(cfg.tasksDir, "t1", "exchange", "DONE"), "x");
+
+    const t2 = path.join(cfg.tasksDir, "t2");
+    await mkdir(path.join(t2, "skills", "a"), { recursive: true });
+    await writeFile(path.join(t2, "skills", "a", "SKILL.md"), "x");
+    await writeFile(path.join(t2, "task.json"), JSON.stringify({ start: "a", nodes: { a: { skill: "a", next: "a" } } }));
+    await until(() => seen.length > 0);
+    expect(seen).toHaveLength(1);
+    expect((await status()).window?.source).toBe("manual");
+    await shutdown();
+  });
+
+  it("stop pendant une plage sans tâche à faire : rien ne tournait, plus rien ne couvre", async () => {
+    await setActiveByHand(false);
+    await boot();
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).idle);
+    const st = await call<StopResult>(sock, "DELETE", "/window");
+    expect(st).toMatchObject({ continuing: null, iteration: null, idle: true, stopping: "now", killed: false });
+    await tick();
+    expect((await status()).idle).toBe(false);
+    expect(seen).toHaveLength(0);
+    await shutdown();
+  });
+
+  /** Démon dont les plages lèvent une erreur inattendue tant que `failing` le dit. Délais : 5, 10, 20, 40 ms, puis panne. */
+  async function bootFailing(failing: (call: number) => boolean) {
+    const h = { calls: 0 };
+    const run: typeof runWindow = async (...args) => {
+      h.calls += 1;
+      if (failing(h.calls)) throw new Error(`EACCES: data/state.json (${h.calls})`);
+      return fakeRunWindow(...args);
+    };
+    daemon = new Daemon(cfg, {
+      runWindow: run,
+      imageExists: async () => true,
+      removeTaskImages: async () => {},
+      dockerVersion: async () => "x",
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "tok" },
+      errorRetry: { firstMs: 5, maxMs: 40 },
+    });
+    await daemon.init();
+    server = createApi(cfg, daemon);
+    await listen(server, sock);
+    ac = new AbortController();
+    loop = daemon.run(ac.signal);
+    return h;
+  }
+
+  it("erreur inattendue passagère : réessais qui s'espacent, puis le travail reprend et le compteur repart à zéro", async () => {
+    const h = await bootFailing((n) => n <= 2);
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).window !== null);
+    const s = await status();
+    expect(h.calls).toBe(3);
+    expect(s.retry).toBeNull();
+    expect(s.fatal).toBeNull();
+    await shutdown();
+  });
+
+  it("erreur inattendue persistante : réessais pendant le délai, puis panne error effacée par reset-error", async () => {
+    let failing = true;
+    const h = await bootFailing(() => failing);
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).retry !== null);
+    expect((await status()).retry).toMatchObject({ attempts: 1, error: expect.stringMatching(/EACCES/) });
+
+    await until(async () => (await status()).fatal !== null);
+    const s = await status();
+    // 5, 10, 20, 40 ms : 4 réessais après la première erreur, le suivant (80 ms) dépasserait le plafond.
+    expect(h.calls).toBe(5);
+    expect(s.fatal).toMatchObject({ reason: "error", detail: "EACCES: data/state.json (5)" });
+    expect(s.retry).toBeNull();
+    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409, message: /panne error/ });
+
+    failing = false;
+    await call(sock, "DELETE", "/fatal");
+    expect((await status()).fatal).toBeNull();
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).window !== null);
+    expect(h.calls).toBe(6);
+    await shutdown();
+  });
+
+  /** Démon dont la première plage finit en panne, les suivantes tournent normalement. */
+  async function bootFatal(opts: { env?: Record<string, string | undefined>; initial?: RunnerState } = {}) {
+    const h = { calls: 0, dockerUp: true };
+    const run: typeof runWindow = async (...args) => {
+      h.calls += 1;
+      if (h.calls === 1) return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "fatal", fatal: { reason: "docker", detail: "down" } };
+      return fakeRunWindow(...args);
+    };
+    if (opts.initial) await saveState(cfg.dataDir, opts.initial);
+    daemon = new Daemon(cfg, {
+      runWindow: run,
+      imageExists: async () => true,
+      removeTaskImages: async () => {},
+      dockerVersion: async () => {
+        if (!h.dockerUp) throw new Error("Cannot connect to the Docker daemon");
+        return "x";
+      },
+      env: opts.env ?? { CLAUDE_CODE_OAUTH_TOKEN: "tok" },
+    });
+    await daemon.init();
+    server = createApi(cfg, daemon);
+    await listen(server, sock);
+    ac = new AbortController();
+    loop = daemon.run(ac.signal);
+    return h;
+  }
+
+  type ResetResult = { manualDropped: string | null; coveringUntil: string | null; nextStart: string | null };
+
+  it("panne pendant une plage manuelle : start et resume refusés, rien ne tourne ; reset-error retire la manuelle sans relancer", async () => {
+    const st = emptyState();
+    st.autoEnabled = false;
+    const h = await bootFatal({ initial: st });
+    const r = await call<{ until: string }>(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    const s = await status();
+    expect(h.calls).toBe(1);
+    expect(s.fatal).toMatchObject({ reason: "docker" });
+    expect(s.window).toBeNull();
+    expect(s.manual?.until).toBe(r.until);
+
+    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409, message: /panne docker en cours/ });
+    await expect(call(sock, "POST", "/auto")).rejects.toMatchObject({ status: 409, message: /reset-error/ });
+    expect((await savedState()).autoEnabled).toBe(false);
+
+    // Pas encore réparé : la panne reste.
+    h.dockerUp = false;
+    await expect(call(sock, "DELETE", "/fatal")).rejects.toMatchObject({ status: 409, message: /Docker ne répond pas/ });
+    expect((await status()).fatal).not.toBeNull();
+
+    h.dockerUp = true;
+    const rs = await call<ResetResult>(sock, "DELETE", "/fatal");
+    expect(rs).toMatchObject({ manualDropped: r.until, coveringUntil: null, nextStart: null });
+    await tick();
+    const s2 = await status();
+    expect(s2.fatal).toBeNull();
+    expect(s2.manual).toBeNull();
+    expect(s2.auto.enabled).toBe(false);
+    expect((await savedState()).window).toBeNull();
+    expect(h.calls).toBe(1);
+
+    // Réparé : une plage manuelle se pose de nouveau.
+    await call(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    expect(h.calls).toBe(2);
+    await shutdown();
+  });
+
+  it("panne pendant une plage automatique : reset-error relance le travail (calendar)", async () => {
+    const { spec, end } = coveringWindow(2);
+    cfg.windows = [spec];
+    const h = await bootFatal();
+    await tick();
+    expect(h.calls).toBe(1);
+    expect((await status()).fatal).toMatchObject({ reason: "docker" });
+
+    const rs = await call<ResetResult>(sock, "DELETE", "/fatal");
+    expect(rs.manualDropped).toBeNull();
+    expect(near(rs.coveringUntil, end)).toBe(true);
+    await tick();
+    expect(h.calls).toBe(2);
+    expect((await status()).window?.source).toBe("calendar");
+    await shutdown();
+  });
+
+  it("reset-error : refusé sans panne, et sans token dans l'environnement du démon", async () => {
+    const h = await bootFatal({ env: {} });
+    await expect(call(sock, "DELETE", "/fatal")).rejects.toMatchObject({ status: 409, message: /aucune panne/ });
+    await call(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    expect(h.calls).toBe(1);
+    await expect(call(sock, "DELETE", "/fatal")).rejects.toMatchObject({ status: 409, message: /CLAUDE_CODE_OAUTH_TOKEN absent/ });
+    expect((await status()).fatal).not.toBeNull();
     await shutdown();
   });
 

@@ -28,6 +28,14 @@ describe("state", () => {
     expect(await readFile(path.join(sub, STATE_FILE), "utf8")).toContain('"version": 1');
   });
 
+  it("un state.json d'avant `autoEnabled` (avec pausedUntil) se charge, plages automatiques actives", async () => {
+    await writeFile(
+      path.join(dir, STATE_FILE),
+      JSON.stringify({ version: 1, window: null, currentTask: null, lastTask: null, pausedUntil: "2026-09-13T06:00:00Z", tasks: {} }),
+    );
+    expect(await loadState(dir)).toEqual(emptyState());
+  });
+
   it("refuse un fichier corrompu avec un message clair", async () => {
     await writeFile(path.join(dir, STATE_FILE), '{"version": 2}');
     await expect(loadState(dir)).rejects.toThrow(/state\.json invalide/);

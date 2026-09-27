@@ -85,8 +85,7 @@ describe("runWindow", () => {
     // 0, 10, 20, 30 min : 4 départs ; le 4e finit à 40 > 35, mais va au bout.
     expect(log).toEqual(["a:next-task", "b:next-task", "a:next-task", "b:next-task"]);
     expect(s).toMatchObject({ iterations: 4, completed: 4, endedBecause: "window", costUsd: 2 });
-    expect(state.window).toBeNull();
-    expect((await loadState(dataDir)).window).toBeNull();
+    expect((await loadState(dataDir)).lastTask).toBe("b");
   });
 
   it("quota avec reset annoncé : dort jusqu'au reset (+30 s), pas 15 min", async () => {
@@ -105,7 +104,7 @@ describe("runWindow", () => {
     expect(log).toEqual(["a:backoff", "a:task-done"]);
   });
 
-  it("panne globale : la plage s'arrête, reste enregistrée, la tâche reste collante", async () => {
+  it("panne globale : la plage s'arrête, la tâche reste collante", async () => {
     const ck = clock(T0, MIN);
     const log: string[] = [];
     const state = emptyState();
@@ -116,7 +115,7 @@ describe("runWindow", () => {
     });
     expect(log).toEqual(["a:next-task", "b:stop-window"]);
     expect(s).toMatchObject({ endedBecause: "fatal", fatal: { reason: "auth" } });
-    expect(state.window).not.toBeNull();
+    expect(state.currentTask).toBe("b");
   });
 
   it("la fin de plage est réévaluée à chaque tour (prolongation)", async () => {
@@ -185,7 +184,7 @@ describe("runWindow", () => {
     expect(log.every((l, i) => i < 2 || l.startsWith("b:"))).toBe(true);
   });
 
-  it("arrêt demandé : l'itération abandonnée ne compte pas, la plage reste enregistrée", async () => {
+  it("arrêt demandé : l'itération abandonnée ne compte pas", async () => {
     const ck = clock(T0, MIN);
     const log: string[] = [];
     const ac = new AbortController();
@@ -203,6 +202,25 @@ describe("runWindow", () => {
     });
     expect(log).toEqual(["a:next-task"]);
     expect(s).toMatchObject({ iterations: 1, endedBecause: "stopped" });
-    expect(state.window?.until).toBe(new Date(T0 + 60 * MIN).toISOString());
+  });
+
+  it("stop gracieux qui retire la dernière source : fin de plage ramenée à maintenant, mais sortie « stopped »", async () => {
+    const ck = clock(T0, 10 * MIN);
+    const log: string[] = [];
+    let until = T0 + 60 * MIN;
+    let stop = false;
+    const s = await runWindow(cfg, [makeTask("a")], emptyState(), () => new Date(until), new AbortController().signal, {
+      now: ck.now,
+      sleep: ck.sleep,
+      shouldStop: () => stop,
+      runIteration: async (t, st) => {
+        const r = await fakeIteration(() => "next-task", ck, log)(t, st);
+        // `unused stop` pendant l'itération : la plage manuelle disparaît et l'arrêt est demandé.
+        until = ck.now().getTime();
+        stop = true;
+        return r;
+      },
+    });
+    expect(s).toMatchObject({ iterations: 1, endedBecause: "stopped" });
   });
 });

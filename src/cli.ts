@@ -5,7 +5,7 @@ import { Command } from "commander";
 import { createApi, listen, socketPath } from "./api.js";
 import { ApiError, call, DaemonUnreachable, stream } from "./client.js";
 import { CONFIG_FILE, loadConfig, type Config } from "./config.js";
-import { Daemon, type DaemonStatus } from "./daemon.js";
+import { Daemon, type DaemonStatus, type StopResult } from "./daemon.js";
 import { removeOrphanContainers } from "./docker.js";
 import { formatDuration } from "./duration.js";
 
@@ -56,7 +56,7 @@ program
     const onSignal = (sig: string): void => {
       signals += 1;
       if (signals > 1) process.exit(130);
-      log(`${sig} reçu : arrêt (l'itération en cours est jetée, la plage sera reprise au prochain démarrage)`);
+      log(`${sig} reçu : arrêt`);
       ac.abort();
     };
     process.on("SIGINT", () => onSignal("SIGINT"));
@@ -73,20 +73,70 @@ program
 
 program
   .command("start")
-  .description("démarre une plage : les tâches actives tournent jusqu'à son terme")
+  .description("pose une plage manuelle : les tâches actives tournent jusqu'à son terme (s'ajoute aux plages automatiques)")
   .requiredOption("--for <duration>", "durée, ex. 8h, 90m, 1d12h")
   .action(async (opts: { for: string }) => {
-    const r = await call<{ until: string }>(await sock(), "POST", "/window", { for: opts.for });
-    console.log(`plage démarrée jusqu'à ${r.until}`);
+    const r = await call<{ until: string; coveredUntil: string }>(await sock(), "POST", "/window", { for: opts.for });
+    const more = r.coveredUntil > r.until ? ` (une plage automatique prolonge jusqu'à ${r.coveredUntil})` : "";
+    console.log(`plage manuelle posée jusqu'à ${r.until}${more}`);
   });
+
+/** Suite du message d'un stop : l'autre source couvre-t-elle encore, ce qui tourne vraiment, et sinon quand ça s'arrête. */
+function stopOutcome(r: StopResult, other: string): string {
+  if (r.continuing) {
+    const doing = r.iteration
+      ? `le travail continue (itération de ${r.iteration} en cours)`
+      : r.idle
+        ? "mais aucune tâche à faire pour l'instant"
+        : "le démon reste en plage";
+    return ` ; ${other} couvre jusqu'à ${r.continuing}, ${doing}`;
+  }
+  if (r.stopping === "after-iteration") {
+    return r.iteration
+      ? ` ; plus rien ne couvre, le travail s'arrête après l'itération de ${r.iteration} en cours`
+      : " ; plus rien ne couvre, le travail s'arrête au prochain tour (aucune itération en cours)";
+  }
+  if (r.killed) return ` ; plus rien ne couvre, itération de ${r.iteration} jetée`;
+  return " ; plus rien ne couvre (aucune itération en cours)";
+}
 
 program
   .command("stop")
-  .description("arrête la plage en cours après l'itération en cours (--now : tout de suite, itération jetée)")
-  .option("--now", "tue l'itération en cours", false)
-  .action(async (opts: { now: boolean }) => {
-    const r = await call<{ stopping: string }>(await sock(), "DELETE", `/window${opts.now ? "?now=1" : ""}`);
-    console.log(r.stopping === "now" ? "plage arrêtée" : "arrêt demandé : la plage s'arrêtera après l'itération en cours");
+  .description("retire la plage manuelle (--auto : coupe les plages automatiques jusqu'à `resume`) ; n'arrête rien si l'autre source couvre encore")
+  .option("--auto", "coupe les plages automatiques au lieu de la plage manuelle", false)
+  .option("--now", "si plus rien ne couvre, tue l'itération en cours (s'il y en a une) au lieu d'attendre sa fin", false)
+  .action(async (opts: { auto: boolean; now: boolean }) => {
+    const q = opts.now ? "?now=1" : "";
+    if (opts.auto) {
+      const r = await call<StopResult>(await sock(), "DELETE", `/auto${q}`);
+      console.log(`plages automatiques coupées jusqu'à \`unused resume\`${stopOutcome(r, "la plage manuelle")}`);
+    } else {
+      const r = await call<StopResult>(await sock(), "DELETE", `/window${q}`);
+      console.log(`plage manuelle retirée (courait jusqu'à ${r.until})${stopOutcome(r, "une plage automatique")}`);
+    }
+  });
+
+program
+  .command("resume")
+  .description("rallume les plages automatiques coupées par `stop --auto` (refusé pendant une panne : `reset-error`)")
+  .action(async () => {
+    const r = await call<{ coveringUntil: string | null; nextStart: string | null }>(await sock(), "POST", "/auto");
+    const detail = r.coveringUntil ? `, plage automatique en cours jusqu'à ${r.coveringUntil}` : r.nextStart ? `, prochaine le ${r.nextStart}` : "";
+    console.log(`plages automatiques rallumées${detail}`);
+  });
+
+program
+  .command("reset-error")
+  .description("efface une panne une fois réparée (vérifie Docker, l'image et le token) ; retire la plage manuelle, seules les plages automatiques relancent")
+  .action(async () => {
+    const r = await call<{ manualDropped: string | null; coveringUntil: string | null; nextStart: string | null }>(await sock(), "DELETE", "/fatal");
+    const manual = r.manualDropped ? ` ; plage manuelle retirée (courait jusqu'à ${r.manualDropped})` : "";
+    const next = r.coveringUntil
+      ? ` ; plage automatique en cours jusqu'à ${r.coveringUntil}, le démon relance`
+      : r.nextStart
+        ? ` ; prochaine plage automatique le ${r.nextStart}`
+        : " ; rien ne couvre : `start --for` pour relancer";
+    console.log(`panne effacée${manual}${next}`);
   });
 
 program
@@ -97,18 +147,25 @@ program
     const s = await call<DaemonStatus>(await sock(), "GET", "/status");
     if (opts.json) return console.log(JSON.stringify(s, null, 2));
     console.log(`démon    pid ${s.daemon.pid}, démarré ${s.daemon.startedAt}`);
-    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused start\` ou redémarre le service`);
+    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused reset-error\` (ou redémarre le service)`);
+    if (s.retry) console.log(`erreur   ${s.retry.error.split("\n")[0]}\n         essai ${s.retry.attempts}, prochain à ${s.retry.nextAt} (panne si ça continue)`);
     const w = s.window;
     if (!w) {
-      console.log("plage    aucune");
+      console.log("travail  aucun (rien ne tourne)");
     } else {
-      console.log(`plage    ${w.source}, jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
+      console.log(`travail  plage ${w.source}, jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
       console.log(`         ${w.iterations} itérations, ${w.completed} completed, ${w.failures} échecs, ${w.backoffs} attentes quota, $${w.costUsd.toFixed(2)}`);
-      if (w.current) console.log(`en cours ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
-      else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil}`);
+      if (w.current) console.log(`en cours itération de ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
+      else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil} (aucune itération)`);
+      else console.log("en cours entre deux itérations");
     }
-    if (s.nextCalendarStart) console.log(`prochaine plage automatique ${s.nextCalendarStart}`);
-    if (s.pausedUntil) console.log(`pause    plages automatiques ignorées jusqu'à ${s.pausedUntil}`);
+    if (s.manual) console.log(`manuelle plage jusqu'à ${s.manual.until}`);
+    else console.log("manuelle aucune plage");
+    const a = s.auto;
+    if (a.windows === 0) console.log("auto     aucune plage configurée");
+    else if (!a.enabled) console.log(`auto     ${a.windows} plage(s), coupées (\`unused resume\`)`);
+    else console.log(`auto     ${a.windows} plage(s)${a.coveringUntil ? `, en cours jusqu'à ${a.coveringUntil}` : ""}${a.nextStart ? `, prochaine le ${a.nextStart}` : ""}`);
+    if (s.idle) console.log("attente  aucune tâche à faire : le travail reprend dès qu'une tâche est ajoutée ou réactivée");
     if (s.lastWindow && !w) {
       const l = s.lastWindow;
       console.log(`dernière ${l.iterations} itérations, ${l.completed} completed, ${l.failures} échecs, $${l.costUsd.toFixed(2)} (${l.endedBecause})`);

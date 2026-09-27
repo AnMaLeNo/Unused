@@ -75,8 +75,6 @@ export async function runWindow(
   const summary: WindowSummary = { iterations: 0, completed: 0, backoffs: 0, failures: 0, costUsd: 0, endedBecause: "window" };
 
   const startedAt = deps.now();
-  state.window = { startedAt: startedAt.toISOString(), until: until().toISOString() };
-  await saveState(cfg.dataDir, state);
   deps.print(`plage jusqu'à ${until().toISOString()} (${formatDuration(until().getTime() - startedAt.getTime())})`);
 
   let stopped = false;
@@ -138,15 +136,10 @@ export async function runWindow(
     if (summary.endedBecause === "fatal") break;
   }
 
-  if (signal.aborted) {
-    summary.endedBecause = "stopped";
-    // La plage reste enregistrée : le démon la reprendra au prochain démarrage.
-  } else {
-    if (stopped) summary.endedBecause = "stopped";
-    // Une panne globale garde la plage : réparée, le démon la reprendra.
-    if (summary.endedBecause !== "fatal") state.window = null;
-    await saveState(cfg.dataDir, state);
-  }
+  // Un stop qui retire la dernière source ramène aussi la fin de plage à maintenant :
+  // la boucle sort par la condition du while avant d'avoir lu shouldStop.
+  if (signal.aborted || stopped || (summary.endedBecause === "window" && deps.shouldStop())) summary.endedBecause = "stopped";
+  if (!signal.aborted) await saveState(cfg.dataDir, state);
   deps.onEvent({ type: "end", summary });
   deps.print(
     `\nfin de plage (${summary.endedBecause}${summary.fatal ? ` ${summary.fatal.reason}` : ""}) : ${summary.iterations} itérations, ${summary.completed} completed, ` +
