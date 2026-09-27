@@ -61,12 +61,21 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
       if (route === "POST /window") {
         const body = await readJson(req);
         if (typeof body.for !== "string") throw new HttpError(400, "champ `for` attendu (ex. \"8h\")");
-        const { until } = await daemon.startWindow(parseDuration(body.for));
-        return sendJson(res, 200, { until: until.toISOString() });
+        const { until, coveredUntil } = await daemon.startWindow(parseDuration(body.for));
+        return sendJson(res, 200, { until: until.toISOString(), coveredUntil: coveredUntil.toISOString() });
       }
 
       if (route === "DELETE /window") {
         return sendJson(res, 200, await daemon.stopWindow(url.searchParams.get("now") === "1"));
+      }
+
+      if (route === "DELETE /auto") {
+        return sendJson(res, 200, await daemon.disableAuto(url.searchParams.get("now") === "1"));
+      }
+
+      if (route === "POST /auto") {
+        const { coveringUntil, nextStart } = await daemon.enableAuto();
+        return sendJson(res, 200, { coveringUntil: coveringUntil?.toISOString() ?? null, nextStart: nextStart?.toISOString() ?? null });
       }
 
       if (route === "POST /tasks") {

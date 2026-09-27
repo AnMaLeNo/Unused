@@ -28,9 +28,13 @@ export interface DaemonStatus {
     current: null | { task: string; node: string; at: string };
     waitingQuotaUntil: string | null;
   };
-  nextCalendarStart: string | null;
-  pausedUntil: string | null;
-  // Panne globale : plus rien ne tourne tant qu'un `start` ne relance pas.
+  // Plage manuelle posée (`start --for`), qu'elle soit en cours d'exécution ou non.
+  manual: null | { until: string };
+  // Plages automatiques : `stop --auto` / `resume`. `coveringUntil` : fin de la plage du calendrier en cours, s'il y en a une.
+  auto: { enabled: boolean; windows: number; coveringUntil: string | null; nextStart: string | null };
+  // Veille : plus rien à faire (ou erreur), on ne relance pas avant cet instant.
+  idleUntil: string | null;
+  // Panne globale : plus rien ne tourne tant qu'un `start` ou un `resume` ne relance pas.
   fatal: null | { reason: "auth" | "docker"; detail: string; at: string };
   lastWindow: WindowSummary | null;
   tasks: TaskInfo[];
@@ -48,12 +52,23 @@ export interface TaskInfo {
   last: TaskState["last"] | null;
 }
 
+type WindowSource = NonNullable<DaemonStatus["window"]>["source"];
+
+export interface StopResult {
+  // La plage retirée couvrait jusqu'à cet instant.
+  until: string | null;
+  // L'autre source couvre encore : le travail continue jusque-là.
+  continuing: string | null;
+  // Plus rien ne couvre : arrêt tout de suite (`now`, ou rien ne tournait) ou après l'itération en cours.
+  stopping: "now" | "after-iteration" | null;
+  // Une itération a été tuée.
+  killed: boolean;
+}
+
 interface Running {
   startedAt: Date;
-  manualUntil: Date | null;
   ac: AbortController;
   stopRequested: boolean;
-  explicitStop: boolean;
   live: { iterations: number; completed: number; failures: number; backoffs: number; costUsd: number };
   current: { task: string; node: string; at: string } | null;
   waitingQuotaUntil: Date | null;
@@ -69,15 +84,17 @@ export interface DaemonDeps {
 }
 
 /**
- * Le processus qui vit. Seul propriétaire de state.json. Il travaille dès
- * qu'une plage le dit — manuelle (`start`) ou automatique (config `windows`),
- * les deux se cumulent — et reprend au démarrage une plage manuelle
- * interrompue par un arrêt du service.
+ * Le processus qui vit. Seul propriétaire de state.json. Deux sources de
+ * plages indépendantes — la plage manuelle (`start` / `stop`) et le calendrier
+ * (`stop --auto` / `resume`) — et il travaille tant qu'au moins l'une des deux
+ * couvre l'instant. La plage manuelle survit à un redémarrage du service.
  */
 export class Daemon {
   private state!: RunnerState;
-  // Plage manuelle demandée (ou reprise), pas encore ou en cours d'exécution.
+  // Plage manuelle posée ; `resumed` : retrouvée dans state.json au démarrage.
   private manual: { until: Date; resumed: boolean } | null = null;
+  // Plus rien à faire (ou erreur) : on ne relance pas avant cet instant. Levé par start, resume, tasks reset/activate.
+  private idleUntil: Date | null = null;
   private running: Running | null = null;
   private lastWindow: WindowSummary | null = null;
   private fatal: DaemonStatus["fatal"] = null;
@@ -99,39 +116,51 @@ export class Daemon {
       const until = new Date(this.state.window.until);
       if (until.getTime() > this.deps.now().getTime()) {
         this.manual = { until, resumed: true };
-        this.deps.print(`plage interrompue trouvée, reprise jusqu'à ${until.toISOString()}`);
+        this.deps.print(`plage manuelle interrompue trouvée, reprise jusqu'à ${until.toISOString()}`);
       } else {
-        this.deps.print("plage enregistrée expirée, oubliée");
+        this.deps.print("plage manuelle enregistrée expirée, oubliée");
         this.state.window = null;
         await saveState(this.cfg.dataDir, this.state);
       }
     }
     if (this.cfg.windows.length > 0) {
       const next = this.nextCalendarStart();
-      this.deps.print(`${this.cfg.windows.length} plage(s) automatique(s)${next ? `, prochaine le ${next.toISOString()}` : ""}`);
+      const detail = !this.state.autoEnabled ? " (désactivées : `unused resume`)" : next ? `, prochaine le ${next.toISOString()}` : "";
+      this.deps.print(`${this.cfg.windows.length} plage(s) automatique(s)${detail}`);
     }
   }
 
-  /** Fin de la plage en cours : le plus tard entre la plage manuelle et la couverture du calendrier. */
-  private deadline(manualUntil: Date | null): Date {
+  /** Plage manuelle encore valable, ou null. */
+  private manualUntil(now: Date): Date | null {
+    return this.manual && this.manual.until.getTime() > now.getTime() ? this.manual.until : null;
+  }
+
+  /** Fin de la couverture actuelle : le plus tard entre la plage manuelle et le calendrier ; `now` si rien ne couvre (ou panne). */
+  private deadline(): Date {
     const now = this.deps.now();
-    const calendar = this.calendarEnd(now);
-    const ends = [manualUntil, calendar].filter((d): d is Date => d !== null).map((d) => d.getTime());
+    if (this.fatal) return now;
+    const ends = [this.manualUntil(now), this.calendarEnd(now)].filter((d): d is Date => d !== null).map((d) => d.getTime());
     return ends.length > 0 ? new Date(Math.max(...ends)) : now;
   }
 
   private calendarEnd(now: Date): Date | null {
-    if (this.fatal) return null;
-    const paused = this.state.pausedUntil ? new Date(this.state.pausedUntil) : null;
-    if (paused && paused.getTime() > now.getTime()) return null;
+    if (this.fatal || !this.state.autoEnabled) return null;
     return coverageEnd(this.cfg.windows, now);
   }
 
   private nextCalendarStart(): Date | null {
-    const now = this.deps.now();
-    const paused = this.state.pausedUntil ? new Date(this.state.pausedUntil) : null;
-    const from = paused && paused.getTime() > now.getTime() ? paused : now;
-    return nextStart(this.cfg.windows, from);
+    if (this.fatal || !this.state.autoEnabled) return null;
+    return nextStart(this.cfg.windows, this.deps.now());
+  }
+
+  private sleeping(now: Date): boolean {
+    return this.idleUntil !== null && this.idleUntil.getTime() > now.getTime();
+  }
+
+  private async setManual(manual: { until: Date; resumed: boolean } | null): Promise<void> {
+    this.manual = manual;
+    this.state.window = manual ? { startedAt: this.deps.now().toISOString(), until: manual.until.toISOString() } : null;
+    await saveState(this.cfg.dataDir, this.state);
   }
 
   /** Boucle principale : travaille quand une plage le dit, attend sinon. Sort quand `signal` est levé. */
@@ -143,13 +172,12 @@ export class Daemon {
     signal.addEventListener("abort", onAbort);
     try {
       while (!signal.aborted) {
-        const manualUntil = this.manual?.until ?? null;
-        if (this.deadline(manualUntil).getTime() > this.deps.now().getTime()) {
-          const resumed = this.manual?.resumed ?? false;
-          await this.execute(manualUntil, resumed);
+        const now = this.deps.now();
+        if (this.manual && this.manualUntil(now) === null) await this.setManual(null);
+        if (this.deadline().getTime() > now.getTime() && !this.sleeping(now)) {
+          await this.execute();
           continue;
         }
-        this.manual = null;
         await this.idle(signal);
       }
     } finally {
@@ -157,11 +185,12 @@ export class Daemon {
     }
   }
 
-  /** Attend un réveil de l'API ou la prochaine plage automatique. */
+  /** Attend un réveil de l'API, la fin de la veille ou la prochaine plage automatique. */
   private idle(signal: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
-      const next = this.fatal ? null : this.nextCalendarStart();
-      const ms = next ? Math.max(0, next.getTime() - this.deps.now().getTime()) : null;
+      const now = this.deps.now();
+      const next = this.sleeping(now) ? this.idleUntil : this.nextCalendarStart();
+      const ms = next ? Math.max(0, next.getTime() - now.getTime()) : null;
       const timer = ms !== null ? setTimeout(done, Math.min(ms, 2_147_000_000)) : null;
       function done(): void {
         if (timer) clearTimeout(timer);
@@ -174,26 +203,25 @@ export class Daemon {
     });
   }
 
-  private async execute(manualUntil: Date | null, resumed: boolean): Promise<void> {
+  private async execute(): Promise<void> {
     const run: Running = {
       startedAt: this.deps.now(),
-      manualUntil,
       ac: new AbortController(),
       stopRequested: false,
-      explicitStop: false,
       live: { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0 },
       current: null,
       waitingQuotaUntil: null,
     };
     this.running = run;
-    const source = this.source(run);
-    this.deps.print(`${resumed ? "reprise de la" : "nouvelle"} plage (${source}) jusqu'à ${this.deadline(manualUntil).toISOString()}`);
+    const resumed = this.manual?.resumed ?? false;
+    if (this.manual) this.manual.resumed = false;
+    this.deps.print(`${resumed ? "reprise de la" : "nouvelle"} plage (${this.source()}) jusqu'à ${this.deadline().toISOString()}`);
     try {
       this.lastWindow = await this.deps.runWindow(
         this.cfg,
         () => this.loadTasks(),
         this.state,
-        () => this.deadline(run.manualUntil),
+        () => this.deadline(),
         run.ac.signal,
         {
           print: this.deps.print,
@@ -204,47 +232,34 @@ export class Daemon {
       );
       if (this.lastWindow.fatal) {
         this.fatal = { ...this.lastWindow.fatal, at: this.deps.now().toISOString() };
-        this.deps.print(`PANNE ${this.fatal.reason} : ${this.fatal.detail.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused start\` (ou un redémarrage du service une fois réparé)`);
+        this.deps.print(`PANNE ${this.fatal.reason} : ${this.fatal.detail.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused resume\` (ou un redémarrage du service) une fois réparé`);
       } else if (this.lastWindow.endedBecause === "nothing-eligible") {
-        // Rien à faire : inutile de relancer tant que la couverture dure. Un
-        // start, un reset ou un activate lèvent la pause.
-        await this.pauseUntil(this.deadline(run.manualUntil), "plus rien à faire");
+        this.sleep("plus rien à faire");
       }
     } catch (err) {
       this.deps.print(`plage interrompue par une erreur : ${(err as Error).message}`);
-      this.state.window = null;
-      await this.pauseUntil(this.deadline(run.manualUntil), "erreur");
+      this.sleep("erreur");
     } finally {
-      if (run.explicitStop && this.state.window) {
-        // Arrêt explicite : on ne reprendra pas cette plage au prochain démarrage.
-        this.state.window = null;
-        await saveState(this.cfg.dataDir, this.state);
-      }
-      if (!run.ac.signal.aborted || run.explicitStop) this.manual = null;
       this.running = null;
     }
   }
 
-  private async pauseUntil(until: Date, why: string): Promise<void> {
-    // Sans calendrier, il n'y a rien à mettre en pause : seules les plages
-    // automatiques sont concernées, une plage manuelle ne revient pas seule.
-    if (this.cfg.windows.length === 0) return;
+  /** Inutile de relancer tant que la couverture actuelle dure ; start, resume, tasks reset/activate réveillent. */
+  private sleep(why: string): void {
+    const until = this.deadline();
     if (until.getTime() <= this.deps.now().getTime()) return;
-    this.state.pausedUntil = until.toISOString();
-    await saveState(this.cfg.dataDir, this.state);
-    this.deps.print(`plages automatiques en pause jusqu'à ${until.toISOString()} (${why})`);
+    this.idleUntil = until;
+    this.deps.print(`veille jusqu'à ${until.toISOString()} (${why})`);
   }
 
-  private async unpause(): Promise<void> {
-    if (this.state.pausedUntil === null) return;
-    this.state.pausedUntil = null;
-    await saveState(this.cfg.dataDir, this.state);
+  private wakeUp(): void {
+    this.idleUntil = null;
     this.wake?.();
   }
 
-  private source(run: Running): DaemonStatus["window"] extends infer W ? (W extends { source: infer S } ? S : never) : never {
+  private source(): WindowSource {
     const now = this.deps.now();
-    const manual = run.manualUntil !== null && run.manualUntil.getTime() > now.getTime();
+    const manual = this.manualUntil(now) !== null;
     const calendar = this.calendarEnd(now) !== null;
     return manual && calendar ? "manual+calendar" : calendar ? "calendar" : "manual";
   }
@@ -281,8 +296,10 @@ export class Daemon {
 
   // --- commandes de l'API ---
 
-  async startWindow(forMs: number): Promise<{ until: Date }> {
-    if (this.running || this.manual) throw new ConflictError("une plage est déjà en cours");
+  /** Pose une plage manuelle. Le calendrier n'est pas touché : si une plage automatique est en cours, la couverture s'étend. */
+  async startWindow(forMs: number): Promise<{ until: Date; coveredUntil: Date }> {
+    const now = this.deps.now();
+    if (this.manualUntil(now)) throw new ConflictError(`une plage manuelle est déjà en cours jusqu'à ${this.manual!.until.toISOString()}`);
     try {
       await this.deps.dockerVersion();
     } catch (err) {
@@ -291,38 +308,64 @@ export class Daemon {
     if (!(await this.deps.imageExists(this.cfg.docker.baseImage))) {
       throw new ConflictError(`image de base ${this.cfg.docker.baseImage} absente : lance \`unused docker build\``);
     }
-    const until = new Date(this.deps.now().getTime() + forMs);
-    this.manual = { until, resumed: false };
     this.fatal = null;
-    this.state.pausedUntil = null;
-    await saveState(this.cfg.dataDir, this.state);
-    this.wake?.();
-    return { until };
+    await this.setManual({ until: new Date(this.deps.now().getTime() + forMs), resumed: false });
+    this.wakeUp();
+    return { until: this.manual!.until, coveredUntil: this.deadline() };
   }
 
-  /**
-   * Arrête la plage en cours. Les plages automatiques sont mises en pause
-   * jusqu'à la fin de la couverture actuelle, sinon le calendrier relancerait
-   * aussitôt.
-   */
-  async stopWindow(now: boolean): Promise<{ stopping: "after-iteration" | "now" }> {
-    if (!this.running) {
-      if (this.manual) {
-        this.manual = null;
-        return { stopping: "now" };
-      }
-      throw new ConflictError("aucune plage en cours");
-    }
-    const run = this.running;
-    this.state.pausedUntil = this.deadline(run.manualUntil).toISOString();
+  /** Retire la plage manuelle. Si le calendrier couvre encore, le travail continue. */
+  async stopWindow(now: boolean): Promise<StopResult> {
+    const until = this.manualUntil(this.deps.now());
+    if (!until) throw new ConflictError("aucune plage manuelle en cours");
+    await this.setManual(null);
+    return this.afterRemoval(until, now);
+  }
+
+  /** Coupe le calendrier jusqu'à `resume`. Si une plage manuelle couvre encore, le travail continue. */
+  async disableAuto(now: boolean): Promise<StopResult> {
+    const until = this.calendarEnd(this.deps.now());
+    this.state.autoEnabled = false;
     await saveState(this.cfg.dataDir, this.state);
-    run.explicitStop = true;
+    return this.afterRemoval(until, now);
+  }
+
+  /** Rallume le calendrier (et efface une panne). */
+  async enableAuto(): Promise<{ coveringUntil: Date | null; nextStart: Date | null }> {
+    this.state.autoEnabled = true;
+    this.fatal = null;
+    await saveState(this.cfg.dataDir, this.state);
+    this.wakeUp();
+    return { coveringUntil: this.calendarEnd(this.deps.now()), nextStart: this.nextCalendarStart() };
+  }
+
+  /** Une source vient d'être retirée : l'autre couvre-t-elle encore ? Sinon, on arrête (tout de suite si `now`). */
+  private afterRemoval(until: Date | null, now: boolean): StopResult {
+    const deadline = this.deadline();
+    const continuing = deadline.getTime() > this.deps.now().getTime() ? deadline : null;
+    // La veille ne doit pas dépasser la couverture restante.
+    if (this.idleUntil && this.idleUntil.getTime() > deadline.getTime()) this.idleUntil = deadline;
+    const run = this.running;
+    const r: StopResult = { until: until?.toISOString() ?? null, continuing: continuing?.toISOString() ?? null, stopping: null, killed: false };
+    if (continuing) {
+      // La fin de plage est réévaluée à chaque tour par le scheduler : rien à faire.
+      this.wake?.();
+      return r;
+    }
+    if (!run) {
+      r.stopping = "now";
+      this.wake?.();
+      return r;
+    }
     if (now) {
       run.ac.abort();
-      return { stopping: "now" };
+      r.killed = run.current !== null;
+      r.stopping = "now";
+    } else {
+      run.stopRequested = true;
+      r.stopping = "after-iteration";
     }
-    run.stopRequested = true;
-    return { stopping: "after-iteration" };
+    return r;
   }
 
   async status(): Promise<DaemonStatus> {
@@ -332,39 +375,30 @@ export class Daemon {
     const nowMs = now.getTime();
     let window: DaemonStatus["window"] = null;
     if (run) {
-      const until = this.deadline(run.manualUntil);
+      const until = this.deadline();
       window = {
         startedAt: run.startedAt.toISOString(),
         until: until.toISOString(),
         remainingMs: Math.max(0, until.getTime() - nowMs),
-        source: this.source(run),
+        source: this.source(),
         stopping: run.stopRequested,
         ...run.live,
         current: run.current,
         waitingQuotaUntil: run.waitingQuotaUntil?.toISOString() ?? null,
       };
-    } else if (this.manual) {
-      window = {
-        startedAt: now.toISOString(),
-        until: this.manual.until.toISOString(),
-        remainingMs: Math.max(0, this.manual.until.getTime() - nowMs),
-        source: "manual",
-        stopping: false,
-        iterations: 0,
-        completed: 0,
-        failures: 0,
-        backoffs: 0,
-        costUsd: 0,
-        current: null,
-        waitingQuotaUntil: null,
-      };
     }
-    const paused = this.state.pausedUntil && new Date(this.state.pausedUntil).getTime() > nowMs ? this.state.pausedUntil : null;
+    const manualUntil = this.manualUntil(now);
     return {
       daemon: { pid: process.pid, startedAt: this.startedAt.toISOString() },
       window,
-      nextCalendarStart: this.fatal ? null : (this.nextCalendarStart()?.toISOString() ?? null),
-      pausedUntil: paused,
+      manual: manualUntil ? { until: manualUntil.toISOString() } : null,
+      auto: {
+        enabled: this.state.autoEnabled,
+        windows: this.cfg.windows.length,
+        coveringUntil: this.calendarEnd(now)?.toISOString() ?? null,
+        nextStart: this.nextCalendarStart()?.toISOString() ?? null,
+      },
+      idleUntil: this.sleeping(now) ? this.idleUntil!.toISOString() : null,
       fatal: this.fatal,
       lastWindow: this.lastWindow,
       tasks: tasks.map((t) => this.taskInfo(t)),
@@ -402,7 +436,7 @@ export class Daemon {
     await saveState(this.cfg.dataDir, this.state);
     await rm(path.join(task.exchangeDir, DONE_FILE), { force: true });
     await this.deps.removeTaskImages(name);
-    await this.unpause();
+    this.wakeUp();
     return { start: task.def.start };
   }
 
@@ -414,12 +448,11 @@ export class Daemon {
     raw.active = active;
     await writeFile(file, JSON.stringify(raw, null, 2) + "\n", "utf8");
     ensureTaskState(this.state, task);
-    if (active) await this.unpause();
+    if (active) this.wakeUp();
   }
 
   describeWindow(): string {
-    const r = this.running;
-    if (!r) return "aucune plage en cours";
-    return `plage en cours, ${formatDuration(this.deadline(r.manualUntil).getTime() - this.deps.now().getTime())} restantes`;
+    if (!this.running) return "aucune plage en cours";
+    return `plage en cours, ${formatDuration(this.deadline().getTime() - this.deps.now().getTime())} restantes`;
   }
 }

@@ -5,7 +5,7 @@ import { Command } from "commander";
 import { createApi, listen, socketPath } from "./api.js";
 import { ApiError, call, DaemonUnreachable, stream } from "./client.js";
 import { CONFIG_FILE, loadConfig, type Config } from "./config.js";
-import { Daemon, type DaemonStatus } from "./daemon.js";
+import { Daemon, type DaemonStatus, type StopResult } from "./daemon.js";
 import { removeOrphanContainers } from "./docker.js";
 import { formatDuration } from "./duration.js";
 
@@ -73,20 +73,44 @@ program
 
 program
   .command("start")
-  .description("démarre une plage : les tâches actives tournent jusqu'à son terme")
+  .description("pose une plage manuelle : les tâches actives tournent jusqu'à son terme (s'ajoute aux plages automatiques)")
   .requiredOption("--for <duration>", "durée, ex. 8h, 90m, 1d12h")
   .action(async (opts: { for: string }) => {
-    const r = await call<{ until: string }>(await sock(), "POST", "/window", { for: opts.for });
-    console.log(`plage démarrée jusqu'à ${r.until}`);
+    const r = await call<{ until: string; coveredUntil: string }>(await sock(), "POST", "/window", { for: opts.for });
+    const more = r.coveredUntil > r.until ? ` (une plage automatique prolonge jusqu'à ${r.coveredUntil})` : "";
+    console.log(`plage manuelle posée jusqu'à ${r.until}${more}`);
   });
+
+/** Suite du message d'un stop : l'autre source couvre-t-elle encore, sinon quand ça s'arrête. */
+function stopOutcome(r: StopResult, other: string): string {
+  if (r.continuing) return ` ; ${other} couvre jusqu'à ${r.continuing}, le travail continue`;
+  if (r.stopping === "after-iteration") return " ; le travail s'arrête après l'itération en cours";
+  return r.killed ? " ; itération en cours jetée" : "";
+}
 
 program
   .command("stop")
-  .description("arrête la plage en cours après l'itération en cours (--now : tout de suite, itération jetée)")
-  .option("--now", "tue l'itération en cours", false)
-  .action(async (opts: { now: boolean }) => {
-    const r = await call<{ stopping: string }>(await sock(), "DELETE", `/window${opts.now ? "?now=1" : ""}`);
-    console.log(r.stopping === "now" ? "plage arrêtée" : "arrêt demandé : la plage s'arrêtera après l'itération en cours");
+  .description("retire la plage manuelle (--auto : coupe les plages automatiques jusqu'à `resume`) ; le travail continue si l'autre source couvre encore")
+  .option("--auto", "coupe les plages automatiques au lieu de la plage manuelle", false)
+  .option("--now", "si plus rien ne couvre, tue l'itération en cours au lieu d'attendre sa fin", false)
+  .action(async (opts: { auto: boolean; now: boolean }) => {
+    const q = opts.now ? "?now=1" : "";
+    if (opts.auto) {
+      const r = await call<StopResult>(await sock(), "DELETE", `/auto${q}`);
+      console.log(`plages automatiques coupées jusqu'à \`unused resume\`${stopOutcome(r, "la plage manuelle")}`);
+    } else {
+      const r = await call<StopResult>(await sock(), "DELETE", `/window${q}`);
+      console.log(`plage manuelle retirée (courait jusqu'à ${r.until})${stopOutcome(r, "une plage automatique")}`);
+    }
+  });
+
+program
+  .command("resume")
+  .description("rallume les plages automatiques coupées par `stop --auto` (et efface une panne)")
+  .action(async () => {
+    const r = await call<{ coveringUntil: string | null; nextStart: string | null }>(await sock(), "POST", "/auto");
+    const detail = r.coveringUntil ? `, plage en cours jusqu'à ${r.coveringUntil}` : r.nextStart ? `, prochaine le ${r.nextStart}` : "";
+    console.log(`plages automatiques rallumées${detail}`);
   });
 
 program
@@ -97,7 +121,7 @@ program
     const s = await call<DaemonStatus>(await sock(), "GET", "/status");
     if (opts.json) return console.log(JSON.stringify(s, null, 2));
     console.log(`démon    pid ${s.daemon.pid}, démarré ${s.daemon.startedAt}`);
-    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused start\` ou redémarre le service`);
+    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused resume\` ou redémarre le service`);
     const w = s.window;
     if (!w) {
       console.log("plage    aucune");
@@ -107,8 +131,12 @@ program
       if (w.current) console.log(`en cours ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
       else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil}`);
     }
-    if (s.nextCalendarStart) console.log(`prochaine plage automatique ${s.nextCalendarStart}`);
-    if (s.pausedUntil) console.log(`pause    plages automatiques ignorées jusqu'à ${s.pausedUntil}`);
+    if (s.manual) console.log(`manuelle jusqu'à ${s.manual.until}`);
+    const a = s.auto;
+    if (a.windows === 0) console.log("auto     aucune plage configurée");
+    else if (!a.enabled) console.log(`auto     ${a.windows} plage(s), coupées (\`unused resume\`)`);
+    else console.log(`auto     ${a.windows} plage(s)${a.coveringUntil ? `, en cours jusqu'à ${a.coveringUntil}` : ""}${a.nextStart ? `, prochaine le ${a.nextStart}` : ""}`);
+    if (s.idleUntil) console.log(`veille   jusqu'à ${s.idleUntil} (plus rien à faire — tasks reset/activate, start ou resume réveillent)`);
     if (s.lastWindow && !w) {
       const l = s.lastWindow;
       console.log(`dernière ${l.iterations} itérations, ${l.completed} completed, ${l.failures} échecs, $${l.costUsd.toFixed(2)} (${l.endedBecause})`);

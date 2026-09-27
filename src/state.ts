@@ -21,14 +21,14 @@ const TaskStateSchema = z.object({
 
 const RunnerStateSchema = z.object({
   version: z.literal(1),
-  // Plage en cours (`run --for`), conservée pour reprendre après un redémarrage.
+  // Plage manuelle en cours (`start --for`), conservée pour reprendre après un redémarrage.
   window: z.object({ startedAt: z.string(), until: z.string() }).nullable(),
   // Tâche « collante » : on y reste tant qu'elle n'a pas produit un `completed`.
   currentTask: z.string().nullable(),
   // Dernière tâche à avoir rendu la main proprement ; point de départ du round-robin.
   lastTask: z.string().nullable(),
-  // Après un `stop`, les plages automatiques sont ignorées jusqu'à cet instant.
-  pausedUntil: z.string().nullable().default(null),
+  // Plages automatiques du calendrier : `stop --auto` les coupe, `resume` les rallume.
+  autoEnabled: z.boolean().default(true),
   tasks: z.record(TaskStateSchema),
 });
 
@@ -36,7 +36,7 @@ export type TaskState = z.infer<typeof TaskStateSchema>;
 export type RunnerState = z.infer<typeof RunnerStateSchema>;
 
 export function emptyState(): RunnerState {
-  return { version: 1, window: null, currentTask: null, lastTask: null, pausedUntil: null, tasks: {} };
+  return { version: 1, window: null, currentTask: null, lastTask: null, autoEnabled: true, tasks: {} };
 }
 
 export function initialTaskState(task: Task): TaskState {

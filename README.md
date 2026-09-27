@@ -91,11 +91,18 @@ Dans `unused.config.json`, en heure locale de la machine :
 ]
 ```
 
-Le démon travaille dès qu'une plage le dit, manuelle (`start`) ou
-automatique ; elles se cumulent (une plage manuelle de 1 h à 5 h et une
-automatique de 3 h à 10 h font une plage de 1 h à 10 h). `stop` met les plages
-automatiques en pause jusqu'à la fin de la couverture en cours ; `start`,
-`tasks reset` ou `tasks activate` lèvent la pause.
+Deux sources de plages, indépendantes : la plage manuelle (`start --for`,
+retirée par `stop`) et le calendrier ci-dessus (coupé par `stop --auto`,
+rallumé par `resume` ; l'état est conservé dans `data/state.json`). Le démon
+travaille tant qu'au moins l'une des deux couvre l'instant. Retirer l'une
+n'arrête rien si l'autre couvre encore : avec une plage automatique de 1 h à
+3 h et une manuelle posée à 2 h pour 2 h, un `stop` à 2 h 30 retire la manuelle
+mais le travail continue jusqu'à 3 h ; un `stop --auto` à 2 h 30 continue
+jusqu'à 4 h. La CLI le dit à chaque fois.
+
+Quand plus aucune tâche n'est éligible, le démon se met en veille jusqu'à la
+fin de la couverture en cours ; `tasks reset`, `tasks activate`, `start` ou
+`resume` le réveillent.
 
 ## Quota
 
@@ -108,24 +115,29 @@ coût en dollars d'un pourcentage de quota.
 
 Deux pannes sont globales et arrêtent la plage au lieu d'épuiser les tâches en
 échecs : le token refusé (401/403) et Docker injoignable. `status` l'affiche en
-tête ; réparer, puis `unused start` ou redémarrer le service.
+tête ; réparer, puis `unused resume` ou redémarrer le service.
 
 ## Piloter
 
 ```
-unused start --for 8h        # démarre une plage (jusqu'à taper la limite)
-unused status                # plage, itération en cours, tâches
-unused stop                  # après l'itération en cours ; --now pour tuer
+unused start --for 8h        # pose une plage manuelle (jusqu'à taper la limite)
+unused stop                  # retire la plage manuelle
+unused stop --auto           # coupe les plages automatiques jusqu'à `resume`
+unused resume                # les rallume
+unused status                # plages, itération en cours, tâches
 unused tasks list | reset <t> | activate <t> | deactivate <t>
 ```
+
+Un `stop` n'arrête le travail que si plus rien ne couvre ; il attend alors la
+fin de l'itération en cours, sauf `--now` qui la tue (le container est jeté).
 
 La CLI trouve le démon par `--socket`, sinon `$UNUSED_SOCKET`, sinon
 `<dataDir>/unused.sock` déduit de `unused.config.json`. Elle ne lit jamais
 `.env` : le token ne sert qu'au démon.
 
-Le démon reprend une plage interrompue par un redémarrage. Les logs de chaque
-itération (le JSON complet rendu par Claude) sont dans `data/logs/<tâche>/`,
-avec un index dans `data/logs/index.jsonl`.
+Le démon reprend une plage manuelle interrompue par un redémarrage. Les logs
+de chaque itération (le JSON complet rendu par Claude) sont dans
+`data/logs/<tâche>/`, avec un index dans `data/logs/index.jsonl`.
 
 ## Configuration
 
