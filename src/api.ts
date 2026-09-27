@@ -1,4 +1,4 @@
-import { unlink } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import { chmodSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -140,9 +140,10 @@ export function probe(sock: string): Promise<boolean> {
   });
 }
 
-/** Écoute sur le socket, après avoir écarté un socket périmé (ou refusé si un démon répond). */
+/** Écoute sur le socket, après avoir écarté un socket périmé (ou refusé si un démon répond). Crée le dossier du socket au besoin. */
 export async function listen(server: http.Server, sock: string): Promise<void> {
   if (await probe(sock)) throw new Error(`un démon répond déjà sur ${sock}`);
+  await mkdir(path.dirname(sock), { recursive: true });
   await unlink(sock).catch(() => {});
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
