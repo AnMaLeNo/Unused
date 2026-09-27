@@ -203,4 +203,24 @@ describe("runWindow", () => {
     expect(log).toEqual(["a:next-task"]);
     expect(s).toMatchObject({ iterations: 1, endedBecause: "stopped" });
   });
+
+  it("stop gracieux qui retire la dernière source : fin de plage ramenée à maintenant, mais sortie « stopped »", async () => {
+    const ck = clock(T0, 10 * MIN);
+    const log: string[] = [];
+    let until = T0 + 60 * MIN;
+    let stop = false;
+    const s = await runWindow(cfg, [makeTask("a")], emptyState(), () => new Date(until), new AbortController().signal, {
+      now: ck.now,
+      sleep: ck.sleep,
+      shouldStop: () => stop,
+      runIteration: async (t, st) => {
+        const r = await fakeIteration(() => "next-task", ck, log)(t, st);
+        // `unused stop` pendant l'itération : la plage manuelle disparaît et l'arrêt est demandé.
+        until = ck.now().getTime();
+        stop = true;
+        return r;
+      },
+    });
+    expect(s).toMatchObject({ iterations: 1, endedBecause: "stopped" });
+  });
 });

@@ -136,7 +136,9 @@ export async function runWindow(
     if (summary.endedBecause === "fatal") break;
   }
 
-  if (signal.aborted || stopped) summary.endedBecause = "stopped";
+  // Un stop qui retire la dernière source ramène aussi la fin de plage à maintenant :
+  // la boucle sort par la condition du while avant d'avoir lu shouldStop.
+  if (signal.aborted || stopped || (summary.endedBecause === "window" && deps.shouldStop())) summary.endedBecause = "stopped";
   if (!signal.aborted) await saveState(cfg.dataDir, state);
   deps.onEvent({ type: "end", summary });
   deps.print(

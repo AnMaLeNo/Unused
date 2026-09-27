@@ -4,7 +4,7 @@ import { coverageEnd, nextStart } from "./calendar.js";
 import type { Config } from "./config.js";
 import { formatDuration } from "./duration.js";
 import { dockerVersion, imageExists, removeTaskImages } from "./docker.js";
-import { DONE_FILE } from "./iterate.js";
+import { DONE_FILE, TOKEN_ENV } from "./iterate.js";
 import { runWindow, type SchedulerEvent, type WindowSummary } from "./scheduler.js";
 import { ensureTaskState, loadState, saveState, type RunnerState, type TaskState } from "./state.js";
 import { loadTasks, TASK_FILE, type Task, type TaskLoadError } from "./task.js";
@@ -34,7 +34,7 @@ export interface DaemonStatus {
   auto: { enabled: boolean; windows: number; coveringUntil: string | null; nextStart: string | null };
   // Veille : plus rien à faire (ou erreur), on ne relance pas avant cet instant.
   idleUntil: string | null;
-  // Panne globale : plus rien ne tourne tant qu'un `start` ou un `resume` ne relance pas.
+  // Panne globale : plus rien ne tourne tant qu'un `reset-error` ne l'efface pas (ou un redémarrage du service).
   fatal: null | { reason: "auth" | "docker"; detail: string; at: string };
   lastWindow: WindowSummary | null;
   tasks: TaskInfo[];
@@ -79,6 +79,7 @@ export interface DaemonDeps {
   imageExists: typeof imageExists;
   removeTaskImages: typeof removeTaskImages;
   dockerVersion: typeof dockerVersion;
+  env: Record<string, string | undefined>;
   now: () => Date;
   print: (line: string) => void;
 }
@@ -93,7 +94,7 @@ export class Daemon {
   private state!: RunnerState;
   // Plage manuelle posée ; `resumed` : retrouvée dans state.json au démarrage.
   private manual: { until: Date; resumed: boolean } | null = null;
-  // Plus rien à faire (ou erreur) : on ne relance pas avant cet instant. Levé par start, resume, tasks reset/activate.
+  // Plus rien à faire (ou erreur) : on ne relance pas avant cet instant. Levé par start, resume, reset-error, tasks reset/activate.
   private idleUntil: Date | null = null;
   private running: Running | null = null;
   private lastWindow: WindowSummary | null = null;
@@ -106,7 +107,7 @@ export class Daemon {
     private readonly cfg: Config,
     deps: Partial<DaemonDeps> = {},
   ) {
-    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, now: () => new Date(), print: () => {}, ...deps };
+    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, now: () => new Date(), print: () => {}, ...deps };
     this.startedAt = this.deps.now();
   }
 
@@ -232,7 +233,7 @@ export class Daemon {
       );
       if (this.lastWindow.fatal) {
         this.fatal = { ...this.lastWindow.fatal, at: this.deps.now().toISOString() };
-        this.deps.print(`PANNE ${this.fatal.reason} : ${this.fatal.detail.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused resume\` (ou un redémarrage du service) une fois réparé`);
+        this.deps.print(`PANNE ${this.fatal.reason} : ${this.fatal.detail.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused reset-error\` (ou un redémarrage du service) une fois réparé`);
       } else if (this.lastWindow.endedBecause === "nothing-eligible") {
         this.sleep("plus rien à faire");
       }
@@ -244,7 +245,7 @@ export class Daemon {
     }
   }
 
-  /** Inutile de relancer tant que la couverture actuelle dure ; start, resume, tasks reset/activate réveillent. */
+  /** Inutile de relancer tant que la couverture actuelle dure ; start, resume, reset-error, tasks reset/activate réveillent. */
   private sleep(why: string): void {
     const until = this.deadline();
     if (until.getTime() <= this.deps.now().getTime()) return;
@@ -294,12 +295,14 @@ export class Daemon {
     return tasks;
   }
 
-  // --- commandes de l'API ---
+  /** Refuse une commande qui relancerait le travail pendant une panne. */
+  private refuseIfFatal(): void {
+    if (!this.fatal) return;
+    throw new ConflictError(`panne ${this.fatal.reason} en cours (${this.fatal.detail.split("\n")[0]}) : répare, puis \`unused reset-error\``);
+  }
 
-  /** Pose une plage manuelle. Le calendrier n'est pas touché : si une plage automatique est en cours, la couverture s'étend. */
-  async startWindow(forMs: number): Promise<{ until: Date; coveredUntil: Date }> {
-    const now = this.deps.now();
-    if (this.manualUntil(now)) throw new ConflictError(`une plage manuelle est déjà en cours jusqu'à ${this.manual!.until.toISOString()}`);
+  /** Docker répond et l'image de base existe, sinon ConflictError. */
+  private async checkDocker(): Promise<void> {
     try {
       await this.deps.dockerVersion();
     } catch (err) {
@@ -308,7 +311,16 @@ export class Daemon {
     if (!(await this.deps.imageExists(this.cfg.docker.baseImage))) {
       throw new ConflictError(`image de base ${this.cfg.docker.baseImage} absente : lance \`unused docker build\``);
     }
-    this.fatal = null;
+  }
+
+  // --- commandes de l'API ---
+
+  /** Pose une plage manuelle. Le calendrier n'est pas touché : si une plage automatique est en cours, la couverture s'étend. */
+  async startWindow(forMs: number): Promise<{ until: Date; coveredUntil: Date }> {
+    this.refuseIfFatal();
+    const now = this.deps.now();
+    if (this.manualUntil(now)) throw new ConflictError(`une plage manuelle est déjà en cours jusqu'à ${this.manual!.until.toISOString()}`);
+    await this.checkDocker();
     await this.setManual({ until: new Date(this.deps.now().getTime() + forMs), resumed: false });
     this.wakeUp();
     return { until: this.manual!.until, coveredUntil: this.deadline() };
@@ -330,13 +342,31 @@ export class Daemon {
     return this.afterRemoval(until, now);
   }
 
-  /** Rallume le calendrier (et efface une panne). */
+  /** Rallume le calendrier. Refusé pendant une panne : c'est `reset-error` qui l'efface. */
   async enableAuto(): Promise<{ coveringUntil: Date | null; nextStart: Date | null }> {
+    this.refuseIfFatal();
     this.state.autoEnabled = true;
-    this.fatal = null;
     await saveState(this.cfg.dataDir, this.state);
     this.wakeUp();
     return { coveringUntil: this.calendarEnd(this.deps.now()), nextStart: this.nextCalendarStart() };
+  }
+
+  /**
+   * Efface la panne, si elle paraît réparée : Docker répond, l'image de base
+   * existe, le token est dans l'environnement du démon. La plage manuelle est
+   * retirée : seul le calendrier (s'il est allumé et couvre) relance le travail.
+   */
+  async resetError(): Promise<{ manualDropped: Date | null; coveringUntil: Date | null; nextStart: Date | null }> {
+    if (!this.fatal) throw new ConflictError("aucune panne en cours");
+    await this.checkDocker();
+    if (!this.deps.env[TOKEN_ENV]) {
+      throw new ConflictError(`${TOKEN_ENV} absent de l'environnement du démon : mets-le dans .env et redémarre le service`);
+    }
+    const manualDropped = this.manualUntil(this.deps.now());
+    if (this.manual) await this.setManual(null);
+    this.fatal = null;
+    this.wakeUp();
+    return { manualDropped, coveringUntil: this.calendarEnd(this.deps.now()), nextStart: this.nextCalendarStart() };
   }
 
   /** Une source vient d'être retirée : l'autre couvre-t-elle encore ? Sinon, on arrête (tout de suite si `now`). */

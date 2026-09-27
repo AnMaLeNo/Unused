@@ -115,7 +115,12 @@ coût en dollars d'un pourcentage de quota.
 
 Deux pannes sont globales et arrêtent la plage au lieu d'épuiser les tâches en
 échecs : le token refusé (401/403) et Docker injoignable. `status` l'affiche en
-tête ; réparer, puis `unused resume` ou redémarrer le service.
+tête. Pendant une panne, `start` et `resume` sont refusés : réparer, puis
+`unused reset-error`. Il vérifie que Docker répond, que l'image de base existe
+et que le token est dans l'environnement du démon, puis efface la panne et
+retire la plage manuelle ; le travail ne reprend que si une plage automatique
+couvre. Le `.env` n'est lu qu'au démarrage du service : un token changé
+demande un redémarrage, qui efface aussi la panne.
 
 ## Piloter
 
@@ -124,6 +129,7 @@ unused start --for 8h        # pose une plage manuelle (jusqu'à taper la limite
 unused stop                  # retire la plage manuelle
 unused stop --auto           # coupe les plages automatiques jusqu'à `resume`
 unused resume                # les rallume
+unused reset-error           # efface une panne une fois réparée
 unused status                # plages, itération en cours, tâches
 unused tasks list | reset <t> | activate <t> | deactivate <t>
 ```

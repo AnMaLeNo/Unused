@@ -106,11 +106,25 @@ program
 
 program
   .command("resume")
-  .description("rallume les plages automatiques coupées par `stop --auto` (et efface une panne)")
+  .description("rallume les plages automatiques coupées par `stop --auto` (refusé pendant une panne : `reset-error`)")
   .action(async () => {
     const r = await call<{ coveringUntil: string | null; nextStart: string | null }>(await sock(), "POST", "/auto");
     const detail = r.coveringUntil ? `, plage en cours jusqu'à ${r.coveringUntil}` : r.nextStart ? `, prochaine le ${r.nextStart}` : "";
     console.log(`plages automatiques rallumées${detail}`);
+  });
+
+program
+  .command("reset-error")
+  .description("efface une panne une fois réparée (vérifie Docker, l'image et le token) ; retire la plage manuelle, seules les plages automatiques relancent")
+  .action(async () => {
+    const r = await call<{ manualDropped: string | null; coveringUntil: string | null; nextStart: string | null }>(await sock(), "DELETE", "/fatal");
+    const manual = r.manualDropped ? ` ; plage manuelle retirée (courait jusqu'à ${r.manualDropped})` : "";
+    const next = r.coveringUntil
+      ? ` ; plage automatique en cours jusqu'à ${r.coveringUntil}, le travail reprend`
+      : r.nextStart
+        ? ` ; prochaine plage automatique le ${r.nextStart}`
+        : " ; rien ne couvre : `start --for` pour relancer";
+    console.log(`panne effacée${manual}${next}`);
   });
 
 program
@@ -121,7 +135,7 @@ program
     const s = await call<DaemonStatus>(await sock(), "GET", "/status");
     if (opts.json) return console.log(JSON.stringify(s, null, 2));
     console.log(`démon    pid ${s.daemon.pid}, démarré ${s.daemon.startedAt}`);
-    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused resume\` ou redémarre le service`);
+    if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused reset-error\` (ou redémarre le service)`);
     const w = s.window;
     if (!w) {
       console.log("plage    aucune");

@@ -319,29 +319,99 @@ describe("daemon + api", () => {
     await shutdown();
   });
 
-  it("panne globale : plus rien ne tourne, même avec une plage manuelle posée ; resume relance", async () => {
-    let calls = 0;
-    const fatalRun: typeof runWindow = async () => {
-      calls += 1;
-      return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "fatal", fatal: { reason: "auth", detail: "401" } };
+  /** Démon dont la première plage finit en panne, les suivantes tournent normalement. */
+  async function bootFatal(opts: { env?: Record<string, string | undefined>; initial?: RunnerState } = {}) {
+    const h = { calls: 0, dockerUp: true };
+    const run: typeof runWindow = async (...args) => {
+      h.calls += 1;
+      if (h.calls === 1) return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "fatal", fatal: { reason: "docker", detail: "down" } };
+      return fakeRunWindow(...args);
     };
-    daemon = new Daemon(cfg, { runWindow: fatalRun, imageExists: async () => true, dockerVersion: async () => "x" });
+    if (opts.initial) await saveState(cfg.dataDir, opts.initial);
+    daemon = new Daemon(cfg, {
+      runWindow: run,
+      imageExists: async () => true,
+      removeTaskImages: async () => {},
+      dockerVersion: async () => {
+        if (!h.dockerUp) throw new Error("Cannot connect to the Docker daemon");
+        return "x";
+      },
+      env: opts.env ?? { CLAUDE_CODE_OAUTH_TOKEN: "tok" },
+    });
     await daemon.init();
     server = createApi(cfg, daemon);
     await listen(server, sock);
     ac = new AbortController();
     loop = daemon.run(ac.signal);
+    return h;
+  }
+
+  type ResetResult = { manualDropped: string | null; coveringUntil: string | null; nextStart: string | null };
+
+  it("panne pendant une plage manuelle : start et resume refusés, rien ne tourne ; reset-error retire la manuelle sans relancer", async () => {
+    const st = emptyState();
+    st.autoEnabled = false;
+    const h = await bootFatal({ initial: st });
     const r = await call<{ until: string }>(sock, "POST", "/window", { for: "1h" });
     await tick();
     const s = await status();
-    expect(calls).toBe(1);
-    expect(s.fatal).toMatchObject({ reason: "auth" });
+    expect(h.calls).toBe(1);
+    expect(s.fatal).toMatchObject({ reason: "docker" });
     expect(s.window).toBeNull();
     expect(s.manual?.until).toBe(r.until);
-    await call(sock, "POST", "/auto");
+
+    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409, message: /panne docker en cours/ });
+    await expect(call(sock, "POST", "/auto")).rejects.toMatchObject({ status: 409, message: /reset-error/ });
+    expect((await savedState()).autoEnabled).toBe(false);
+
+    // Pas encore réparé : la panne reste.
+    h.dockerUp = false;
+    await expect(call(sock, "DELETE", "/fatal")).rejects.toMatchObject({ status: 409, message: /Docker ne répond pas/ });
+    expect((await status()).fatal).not.toBeNull();
+
+    h.dockerUp = true;
+    const rs = await call<ResetResult>(sock, "DELETE", "/fatal");
+    expect(rs).toMatchObject({ manualDropped: r.until, coveringUntil: null, nextStart: null });
     await tick();
-    expect(calls).toBe(2);
-    expect((await status()).fatal).toMatchObject({ reason: "auth" });
+    const s2 = await status();
+    expect(s2.fatal).toBeNull();
+    expect(s2.manual).toBeNull();
+    expect(s2.auto.enabled).toBe(false);
+    expect((await savedState()).window).toBeNull();
+    expect(h.calls).toBe(1);
+
+    // Réparé : une plage manuelle se pose de nouveau.
+    await call(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    expect(h.calls).toBe(2);
+    await shutdown();
+  });
+
+  it("panne pendant une plage automatique : reset-error relance le travail (calendar)", async () => {
+    const { spec, end } = coveringWindow(2);
+    cfg.windows = [spec];
+    const h = await bootFatal();
+    await tick();
+    expect(h.calls).toBe(1);
+    expect((await status()).fatal).toMatchObject({ reason: "docker" });
+
+    const rs = await call<ResetResult>(sock, "DELETE", "/fatal");
+    expect(rs.manualDropped).toBeNull();
+    expect(near(rs.coveringUntil, end)).toBe(true);
+    await tick();
+    expect(h.calls).toBe(2);
+    expect((await status()).window?.source).toBe("calendar");
+    await shutdown();
+  });
+
+  it("reset-error : refusé sans panne, et sans token dans l'environnement du démon", async () => {
+    const h = await bootFatal({ env: {} });
+    await expect(call(sock, "DELETE", "/fatal")).rejects.toMatchObject({ status: 409, message: /aucune panne/ });
+    await call(sock, "POST", "/window", { for: "1h" });
+    await tick();
+    expect(h.calls).toBe(1);
+    await expect(call(sock, "DELETE", "/fatal")).rejects.toMatchObject({ status: 409, message: /CLAUDE_CODE_OAUTH_TOKEN absent/ });
+    expect((await status()).fatal).not.toBeNull();
     await shutdown();
   });
 

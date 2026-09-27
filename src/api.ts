@@ -78,6 +78,15 @@ export function createApi(cfg: Config, daemon: Daemon): http.Server {
         return sendJson(res, 200, { coveringUntil: coveringUntil?.toISOString() ?? null, nextStart: nextStart?.toISOString() ?? null });
       }
 
+      if (route === "DELETE /fatal") {
+        const { manualDropped, coveringUntil, nextStart } = await daemon.resetError();
+        return sendJson(res, 200, {
+          manualDropped: manualDropped?.toISOString() ?? null,
+          coveringUntil: coveringUntil?.toISOString() ?? null,
+          nextStart: nextStart?.toISOString() ?? null,
+        });
+      }
+
       if (route === "POST /tasks") {
         const body = await readJson(req);
         if (typeof body.name !== "string") throw new HttpError(400, "champ `name` attendu");
