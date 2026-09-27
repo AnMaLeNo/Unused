@@ -4,6 +4,7 @@ import path from "node:path";
 import { coverageEnd, nextStart } from "./calendar.js";
 import type { Config } from "./config.js";
 import { dockerVersion, imageExists, removeTaskImages } from "./docker.js";
+import { formatDuration } from "./duration.js";
 import { pickNext } from "./graph.js";
 import { DONE_FILE, TOKEN_ENV } from "./iterate.js";
 import { runWindow, type SchedulerEvent, type WindowSummary } from "./scheduler.js";
@@ -33,10 +34,13 @@ export interface DaemonStatus {
   manual: null | { until: string };
   // Plages automatiques : `stop --auto` / `resume`. `coveringUntil` : fin de la plage du calendrier en cours, s'il y en a une.
   auto: { enabled: boolean; windows: number; coveringUntil: string | null; nextStart: string | null };
-  // Une plage couvre mais aucune tâche n'est à faire : rien ne tourne, les tâches sont relues régulièrement.
+  // Une plage couvre mais aucune tâche n'est à faire : rien ne tourne, on attend un changement dans tasks/.
   idle: boolean;
+  // Plage interrompue par une erreur inattendue : nouvel essai à `nextAt` (null pendant qu'une plage tourne).
+  retry: null | { attempts: number; error: string; nextAt: string };
   // Panne globale : plus rien ne tourne tant qu'un `reset-error` ne l'efface pas (ou un redémarrage du service).
-  fatal: null | { reason: "auth" | "docker"; detail: string; at: string };
+  // `error` : une erreur inattendue qui a épuisé ses essais.
+  fatal: null | { reason: "auth" | "docker" | "error"; detail: string; at: string };
   lastWindow: WindowSummary | null;
   tasks: TaskInfo[];
   taskErrors: TaskLoadError[];
@@ -90,12 +94,16 @@ export function isTaskChange(filename: string | null): boolean {
   return parts.length === 1 || (parts.length === 2 && parts[1] === TASK_FILE);
 }
 
+/** Après une erreur inattendue : 1 s, 2 s, 4 s… ; si le délai suivant dépasse `maxMs`, c'est une panne. */
+export const ERROR_RETRY = { firstMs: 1_000, maxMs: 15 * 60_000 };
+
 export interface DaemonDeps {
   runWindow: typeof runWindow;
   imageExists: typeof imageExists;
   removeTaskImages: typeof removeTaskImages;
   dockerVersion: typeof dockerVersion;
   env: Record<string, string | undefined>;
+  errorRetry: typeof ERROR_RETRY;
   now: () => Date;
   print: (line: string) => void;
 }
@@ -120,6 +128,8 @@ export class Daemon {
   private running: Running | null = null;
   private lastWindow: WindowSummary | null = null;
   private fatal: DaemonStatus["fatal"] = null;
+  // Erreurs inattendues d'affilée ; remis à zéro par une plage qui se termine sans erreur.
+  private retry: { attempts: number; error: string; nextAt: Date } | null = null;
   private wake: (() => void) | null = null;
   private readonly startedAt: Date;
   private readonly deps: DaemonDeps;
@@ -128,7 +138,7 @@ export class Daemon {
     private readonly cfg: Config,
     deps: Partial<DaemonDeps> = {},
   ) {
-    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, now: () => new Date(), print: () => {}, ...deps };
+    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, errorRetry: ERROR_RETRY, now: () => new Date(), print: () => {}, ...deps };
     this.startedAt = this.deps.now();
   }
 
@@ -201,10 +211,21 @@ export class Daemon {
         if (deadline.getTime() > now.getTime()) {
           // Une plage couvre : s'il y a une tâche à faire, on la fait ; sinon on attend
           // qu'une tâche change dans tasks/ (ou qu'une commande réveille), au plus jusqu'à la fin de la plage.
+          if (this.retry && this.retry.nextAt.getTime() > now.getTime()) {
+            await this.idle(signal, new Date(Math.min(this.retry.nextAt.getTime(), deadline.getTime())));
+            continue;
+          }
           if (await this.hasWork()) {
             this.setNothingToDo(false);
-            if (await this.execute()) continue;
-          } else this.setNothingToDo(true);
+            const error = await this.execute();
+            if (error === null) {
+              this.retry = null;
+            } else {
+              this.onError(error);
+            }
+            continue;
+          }
+          this.setNothingToDo(true);
           await this.idle(signal, deadline);
           continue;
         }
@@ -296,8 +317,22 @@ export class Daemon {
     });
   }
 
-  /** Fait tourner une plage ; false si elle a été interrompue par une erreur. */
-  private async execute(): Promise<boolean> {
+  /** Erreur inattendue : nouvel essai après un délai qui double, puis panne quand il dépasserait le plafond. */
+  private onError(error: string): void {
+    const attempts = (this.retry?.attempts ?? 0) + 1;
+    const delay = this.deps.errorRetry.firstMs * 2 ** (attempts - 1);
+    if (delay > this.deps.errorRetry.maxMs) {
+      this.retry = null;
+      this.fatal = { reason: "error", detail: error, at: this.deps.now().toISOString() };
+      this.deps.print(`PANNE error après ${attempts - 1} essais : ${error.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused reset-error\` (ou un redémarrage du service) une fois réparé`);
+      return;
+    }
+    this.retry = { attempts, error, nextAt: new Date(this.deps.now().getTime() + delay) };
+    this.deps.print(`nouvel essai dans ${formatDuration(delay)} (essai ${attempts})`);
+  }
+
+  /** Fait tourner une plage ; le message de l'erreur inattendue qui l'a interrompue, ou null. */
+  private async execute(): Promise<string | null> {
     const run: Running = {
       startedAt: this.deps.now(),
       ac: new AbortController(),
@@ -328,10 +363,11 @@ export class Daemon {
         this.fatal = { ...this.lastWindow.fatal, at: this.deps.now().toISOString() };
         this.deps.print(`PANNE ${this.fatal.reason} : ${this.fatal.detail.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused reset-error\` (ou un redémarrage du service) une fois réparé`);
       }
-      return true;
+      return null;
     } catch (err) {
-      this.deps.print(`plage interrompue par une erreur : ${(err as Error).message}`);
-      return false;
+      const message = (err as Error).message;
+      this.deps.print(`plage interrompue par une erreur : ${message}`);
+      return message;
     } finally {
       this.running = null;
     }
@@ -448,6 +484,7 @@ export class Daemon {
     const manualDropped = this.manualUntil(this.deps.now());
     if (this.manual) await this.setManual(null);
     this.fatal = null;
+    this.retry = null;
     this.wakeUp();
     return { manualDropped, coveringUntil: this.calendarEnd(this.deps.now()), nextStart: this.nextCalendarStart() };
   }
@@ -518,6 +555,7 @@ export class Daemon {
         nextStart: this.nextCalendarStart()?.toISOString() ?? null,
       },
       idle: this.nothingToDo,
+      retry: this.retry && !run ? { ...this.retry, nextAt: this.retry.nextAt.toISOString() } : null,
       fatal: this.fatal,
       lastWindow: this.lastWindow,
       tasks: tasks.map((t) => this.taskInfo(t)),

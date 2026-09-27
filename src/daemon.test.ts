@@ -368,6 +368,65 @@ describe("daemon + api", () => {
     await shutdown();
   });
 
+  /** Démon dont les plages lèvent une erreur inattendue tant que `failing` le dit. Délais : 5, 10, 20, 40 ms, puis panne. */
+  async function bootFailing(failing: (call: number) => boolean) {
+    const h = { calls: 0 };
+    const run: typeof runWindow = async (...args) => {
+      h.calls += 1;
+      if (failing(h.calls)) throw new Error(`EACCES: data/state.json (${h.calls})`);
+      return fakeRunWindow(...args);
+    };
+    daemon = new Daemon(cfg, {
+      runWindow: run,
+      imageExists: async () => true,
+      removeTaskImages: async () => {},
+      dockerVersion: async () => "x",
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "tok" },
+      errorRetry: { firstMs: 5, maxMs: 40 },
+    });
+    await daemon.init();
+    server = createApi(cfg, daemon);
+    await listen(server, sock);
+    ac = new AbortController();
+    loop = daemon.run(ac.signal);
+    return h;
+  }
+
+  it("erreur inattendue passagère : réessais qui s'espacent, puis le travail reprend et le compteur repart à zéro", async () => {
+    const h = await bootFailing((n) => n <= 2);
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).window !== null);
+    const s = await status();
+    expect(h.calls).toBe(3);
+    expect(s.retry).toBeNull();
+    expect(s.fatal).toBeNull();
+    await shutdown();
+  });
+
+  it("erreur inattendue persistante : réessais pendant le délai, puis panne error effacée par reset-error", async () => {
+    let failing = true;
+    const h = await bootFailing(() => failing);
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).retry !== null);
+    expect((await status()).retry).toMatchObject({ attempts: 1, error: expect.stringMatching(/EACCES/) });
+
+    await until(async () => (await status()).fatal !== null);
+    const s = await status();
+    // 5, 10, 20, 40 ms : 4 réessais après la première erreur, le suivant (80 ms) dépasserait le plafond.
+    expect(h.calls).toBe(5);
+    expect(s.fatal).toMatchObject({ reason: "error", detail: "EACCES: data/state.json (5)" });
+    expect(s.retry).toBeNull();
+    await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409, message: /panne error/ });
+
+    failing = false;
+    await call(sock, "DELETE", "/fatal");
+    expect((await status()).fatal).toBeNull();
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).window !== null);
+    expect(h.calls).toBe(6);
+    await shutdown();
+  });
+
   /** Démon dont la première plage finit en panne, les suivantes tournent normalement. */
   async function bootFatal(opts: { env?: Record<string, string | undefined>; initial?: RunnerState } = {}) {
     const h = { calls: 0, dockerUp: true };

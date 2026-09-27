@@ -115,8 +115,11 @@ coût et le modèle sont dans `data/logs/index.jsonl` : de quoi rapprocher un
 coût en dollars d'un pourcentage de quota.
 
 Deux pannes sont globales et arrêtent la plage au lieu d'épuiser les tâches en
-échecs : le token refusé (401/403) et Docker injoignable. `status` l'affiche en
-tête. Pendant une panne, `start` et `resume` sont refusés : réparer, puis
+échecs : le token refusé (401/403) et Docker injoignable. Une erreur inattendue
+(ni Docker ni auth) interrompt la plage et est réessayée après 1 s, 2 s, 4 s… ;
+quand le délai suivant dépasserait 15 min, elle devient à son tour une panne
+(`error`). `status` affiche la panne en tête, et l'erreur en cours de réessai.
+Pendant une panne, `start` et `resume` sont refusés : réparer, puis
 `unused reset-error`. Il vérifie que Docker répond, que l'image de base existe
 et que le token est dans l'environnement du démon, puis efface la panne et
 retire la plage manuelle ; le travail ne reprend que si une plage automatique

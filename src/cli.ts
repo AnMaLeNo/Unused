@@ -148,6 +148,7 @@ program
     if (opts.json) return console.log(JSON.stringify(s, null, 2));
     console.log(`démon    pid ${s.daemon.pid}, démarré ${s.daemon.startedAt}`);
     if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused reset-error\` (ou redémarre le service)`);
+    if (s.retry) console.log(`erreur   ${s.retry.error.split("\n")[0]}\n         essai ${s.retry.attempts}, prochain à ${s.retry.nextAt} (panne si ça continue)`);
     const w = s.window;
     if (!w) {
       console.log("travail  aucun (rien ne tourne)");
