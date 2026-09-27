@@ -101,9 +101,9 @@ mais le travail continue jusqu'à 3 h ; un `stop --auto` à 2 h 30 continue
 jusqu'à 4 h. La CLI le dit à chaque fois.
 
 Pendant une plage, le démon travaille dès qu'une tâche est à faire. Quand il
-n'y en a aucune, il relit les tâches toutes les 30 s (tout de suite après
-`tasks reset` ou `tasks activate`) : une tâche ajoutée ou réactivée est prise
-sans rien relancer.
+n'y en a aucune, il attend : il surveille `tasks/`, et une tâche ajoutée ou un
+`task.json` modifié (à la main ou par `tasks reset` / `tasks activate`) le
+réveille aussitôt, sans rien relancer.
 
 ## Quota
 

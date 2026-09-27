@@ -1,4 +1,5 @@
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { watch, type FSWatcher } from "node:fs";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { coverageEnd, nextStart } from "./calendar.js";
 import type { Config } from "./config.js";
@@ -78,8 +79,16 @@ interface Running {
   waitingQuotaUntil: Date | null;
 }
 
-// Pendant une plage sans tâche à faire, les tâches sont relues à ce rythme.
-const TASK_POLL_MS = 30_000;
+/**
+ * Un changement dans tasks/ qui peut rendre une tâche éligible : un dossier de
+ * tâche ajouté ou retiré, ou un task.json modifié. Le reste (exchange/, skills)
+ * est ignoré : les containers y écrivent pendant chaque itération.
+ */
+export function isTaskChange(filename: string | null): boolean {
+  if (filename === null) return true;
+  const parts = filename.split(path.sep);
+  return parts.length === 1 || (parts.length === 2 && parts[1] === TASK_FILE);
+}
 
 export interface DaemonDeps {
   runWindow: typeof runWindow;
@@ -87,8 +96,6 @@ export interface DaemonDeps {
   removeTaskImages: typeof removeTaskImages;
   dockerVersion: typeof dockerVersion;
   env: Record<string, string | undefined>;
-  // Pendant une plage sans tâche à faire (ou après une erreur), délai avant de relire les tâches.
-  taskPollMs: number;
   now: () => Date;
   print: (line: string) => void;
 }
@@ -105,6 +112,11 @@ export class Daemon {
   private manual: { until: Date; resumed: boolean } | null = null;
   // Une plage couvre mais aucune tâche n'est à faire.
   private nothingToDo = false;
+  // Surveillance de tasks/ (et l'inode surveillé, pour voir un dossier supprimé puis recréé).
+  private watcher: FSWatcher | null = null;
+  private watchedIno: number | null = null;
+  private watchProblem: string | null = null;
+  private changeTimer: NodeJS.Timeout | null = null;
   private running: Running | null = null;
   private lastWindow: WindowSummary | null = null;
   private fatal: DaemonStatus["fatal"] = null;
@@ -116,7 +128,7 @@ export class Daemon {
     private readonly cfg: Config,
     deps: Partial<DaemonDeps> = {},
   ) {
-    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, taskPollMs: TASK_POLL_MS, now: () => new Date(), print: () => {}, ...deps };
+    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, now: () => new Date(), print: () => {}, ...deps };
     this.startedAt = this.deps.now();
   }
 
@@ -182,23 +194,26 @@ export class Daemon {
     signal.addEventListener("abort", onAbort);
     try {
       while (!signal.aborted) {
+        await this.watchTasks();
         const now = this.deps.now();
         if (this.manual && this.manualUntil(now) === null) await this.setManual(null);
-        if (this.deadline().getTime() > now.getTime()) {
-          // Une plage couvre : s'il y a une tâche à faire, on la fait ; sinon on relit
-          // les tâches un peu plus tard (une tâche ajoutée à la main est vue ainsi).
+        const deadline = this.deadline();
+        if (deadline.getTime() > now.getTime()) {
+          // Une plage couvre : s'il y a une tâche à faire, on la fait ; sinon on attend
+          // qu'une tâche change dans tasks/ (ou qu'une commande réveille), au plus jusqu'à la fin de la plage.
           if (await this.hasWork()) {
             this.setNothingToDo(false);
             if (await this.execute()) continue;
           } else this.setNothingToDo(true);
-          await this.idle(signal, this.deps.taskPollMs);
+          await this.idle(signal, deadline);
           continue;
         }
         this.setNothingToDo(false);
-        await this.idle(signal, null);
+        await this.idle(signal, this.nextCalendarStart());
       }
     } finally {
       signal.removeEventListener("abort", onAbort);
+      this.unwatchTasks();
     }
   }
 
@@ -214,18 +229,61 @@ export class Daemon {
 
   private setNothingToDo(value: boolean): void {
     if (value && !this.nothingToDo) {
-      this.deps.print(`aucune tâche à faire : rien ne tourne, tâches relues toutes les ${Math.round(this.deps.taskPollMs / 1000)} s`);
+      this.deps.print("aucune tâche à faire : rien ne tourne, en attente d'un changement dans les tâches");
     }
     this.nothingToDo = value;
   }
 
-  /** Attend un réveil de l'API, la prochaine plage automatique, ou au plus `maxMs`. */
-  private idle(signal: AbortSignal, maxMs: number | null): Promise<void> {
+  /**
+   * Surveille tasks/ : une tâche ajoutée ou modifiée à la main réveille le démon.
+   * Rappelé à chaque tour : si le dossier a été supprimé ou remplacé, la surveillance est refaite.
+   */
+  private async watchTasks(): Promise<void> {
+    const dir = this.cfg.tasksDir;
+    const ino = await stat(dir).then((s) => s.ino, () => null);
+    if (this.watcher && ino === this.watchedIno) return;
+    this.unwatchTasks();
+    if (ino === null) return this.noteWatchProblem(`${dir} absent : les tâches ajoutées ne seront pas vues avant la prochaine commande`);
+    try {
+      this.watcher = watch(dir, { recursive: true }, (_event, filename) => {
+        if (!isTaskChange(filename)) return;
+        // Un éditeur écrit souvent en plusieurs fois : un seul réveil pour la rafale.
+        if (this.changeTimer) clearTimeout(this.changeTimer);
+        this.changeTimer = setTimeout(() => {
+          this.changeTimer = null;
+          this.wakeUp();
+        }, 200);
+      });
+      this.watcher.on("error", (err) => {
+        this.noteWatchProblem(`surveillance de ${dir} interrompue : ${err.message}`);
+        this.unwatchTasks();
+        this.wakeUp();
+      });
+      this.watchedIno = ino;
+      this.noteWatchProblem(null);
+    } catch (err) {
+      this.noteWatchProblem(`surveillance de ${dir} impossible : ${(err as Error).message}`);
+    }
+  }
+
+  private unwatchTasks(): void {
+    this.watcher?.close();
+    this.watcher = null;
+    this.watchedIno = null;
+    if (this.changeTimer) clearTimeout(this.changeTimer);
+    this.changeTimer = null;
+  }
+
+  /** Dit un problème de surveillance une seule fois, pas à chaque tour. */
+  private noteWatchProblem(problem: string | null): void {
+    if (problem && problem !== this.watchProblem) this.deps.print(problem);
+    this.watchProblem = problem;
+  }
+
+  /** Attend un réveil (API, changement dans tasks/) ou l'instant `until`. */
+  private idle(signal: AbortSignal, until: Date | null): Promise<void> {
     return new Promise<void>((resolve) => {
-      const now = this.deps.now();
-      const next = this.nextCalendarStart();
-      const untilNext = next ? Math.max(0, next.getTime() - now.getTime()) : null;
-      const ms = maxMs === null ? untilNext : untilNext === null ? maxMs : Math.min(untilNext, maxMs);
+      const ms = until ? Math.max(0, until.getTime() - this.deps.now().getTime()) : null;
       const timer = ms !== null ? setTimeout(done, Math.min(ms, 2_147_000_000)) : null;
       function done(): void {
         if (timer) clearTimeout(timer);

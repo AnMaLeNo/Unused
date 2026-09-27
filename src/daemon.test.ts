@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApi, listen, socketPath } from "./api.js";
 import { ApiError, call } from "./client.js";
 import type { Config } from "./config.js";
-import { Daemon, type DaemonDeps, type DaemonStatus, type StopResult } from "./daemon.js";
+import { Daemon, isTaskChange, type DaemonStatus, type StopResult } from "./daemon.js";
 import type { runWindow, SchedulerDeps, WindowSummary } from "./scheduler.js";
 import { emptyState, saveState, type RunnerState } from "./state.js";
 import type { WindowSpec } from "./calendar.js";
@@ -53,9 +53,9 @@ function coveringWindow(hours: number): { spec: WindowSpec; end: Date } {
 const near = (iso: string | null | undefined, d: Date) => Math.abs(new Date(iso ?? 0).getTime() - d.getTime()) < 60_000;
 const savedState = async () => JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")) as RunnerState;
 
-async function boot(initial?: RunnerState, print: (line: string) => void = () => {}, deps: Partial<DaemonDeps> = {}): Promise<void> {
+async function boot(initial?: RunnerState, print: (line: string) => void = () => {}): Promise<void> {
   if (initial) await saveState(cfg.dataDir, initial);
-  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x", print, ...deps });
+  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x", print });
   await daemon.init();
   server = createApi(cfg, daemon);
   await listen(server, sock);
@@ -93,6 +93,17 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
+});
+
+describe("isTaskChange", () => {
+  it("réveille pour un dossier de tâche ou un task.json, pas pour exchange/ ni les skills", () => {
+    expect(isTaskChange("t2")).toBe(true);
+    expect(isTaskChange(path.join("t1", "task.json"))).toBe(true);
+    expect(isTaskChange(null)).toBe(true);
+    expect(isTaskChange(path.join("t1", "exchange"))).toBe(false);
+    expect(isTaskChange(path.join("t1", "exchange", "DONE"))).toBe(false);
+    expect(isTaskChange(path.join("t1", "skills", "a", "SKILL.md"))).toBe(false);
+  });
 });
 
 describe("daemon + api", () => {
@@ -305,7 +316,7 @@ describe("daemon + api", () => {
 
   it("plage sans tâche à faire : rien ne tourne ; une tâche réactivée à la main est prise pendant la plage", async () => {
     await setActiveByHand(false);
-    await boot(undefined, undefined, { taskPollMs: 10 });
+    await boot();
     const r = await call<{ until: string }>(sock, "POST", "/window", { for: "1h" });
     await tick();
     const s = await status();
@@ -323,9 +334,30 @@ describe("daemon + api", () => {
     await shutdown();
   });
 
+  it("plage sans tâche à faire : un dossier de tâche ajouté à la main est pris", async () => {
+    await setActiveByHand(false);
+    await boot();
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).idle);
+    expect(seen).toHaveLength(0);
+
+    // Les écritures d'un container dans exchange/ ne réveillent pas.
+    await mkdir(path.join(cfg.tasksDir, "t1", "exchange"), { recursive: true });
+    await writeFile(path.join(cfg.tasksDir, "t1", "exchange", "DONE"), "x");
+
+    const t2 = path.join(cfg.tasksDir, "t2");
+    await mkdir(path.join(t2, "skills", "a"), { recursive: true });
+    await writeFile(path.join(t2, "skills", "a", "SKILL.md"), "x");
+    await writeFile(path.join(t2, "task.json"), JSON.stringify({ start: "a", nodes: { a: { skill: "a", next: "a" } } }));
+    await until(() => seen.length > 0);
+    expect(seen).toHaveLength(1);
+    expect((await status()).window?.source).toBe("manual");
+    await shutdown();
+  });
+
   it("stop pendant une plage sans tâche à faire : rien ne tournait, plus rien ne couvre", async () => {
     await setActiveByHand(false);
-    await boot(undefined, undefined, { taskPollMs: 10 });
+    await boot();
     await call(sock, "POST", "/window", { for: "1h" });
     await until(async () => (await status()).idle);
     const st = await call<StopResult>(sock, "DELETE", "/window");
