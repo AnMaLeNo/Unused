@@ -56,7 +56,7 @@ program
     const onSignal = (sig: string): void => {
       signals += 1;
       if (signals > 1) process.exit(130);
-      log(`${sig} reçu : arrêt (l'itération en cours est jetée, la plage sera reprise au prochain démarrage)`);
+      log(`${sig} reçu : arrêt`);
       ac.abort();
     };
     process.on("SIGINT", () => onSignal("SIGINT"));
@@ -81,18 +81,30 @@ program
     console.log(`plage manuelle posée jusqu'à ${r.until}${more}`);
   });
 
-/** Suite du message d'un stop : l'autre source couvre-t-elle encore, sinon quand ça s'arrête. */
+/** Suite du message d'un stop : l'autre source couvre-t-elle encore, ce qui tourne vraiment, et sinon quand ça s'arrête. */
 function stopOutcome(r: StopResult, other: string): string {
-  if (r.continuing) return ` ; ${other} couvre jusqu'à ${r.continuing}, le travail continue`;
-  if (r.stopping === "after-iteration") return " ; le travail s'arrête après l'itération en cours";
-  return r.killed ? " ; itération en cours jetée" : "";
+  if (r.continuing) {
+    const doing = r.iteration
+      ? `le travail continue (itération de ${r.iteration} en cours)`
+      : r.idle
+        ? "mais le démon est en veille (plus rien à faire)"
+        : "le démon reste en plage";
+    return ` ; ${other} couvre jusqu'à ${r.continuing}, ${doing}`;
+  }
+  if (r.stopping === "after-iteration") {
+    return r.iteration
+      ? ` ; plus rien ne couvre, le travail s'arrête après l'itération de ${r.iteration} en cours`
+      : " ; plus rien ne couvre, le travail s'arrête au prochain tour (aucune itération en cours)";
+  }
+  if (r.killed) return ` ; plus rien ne couvre, itération de ${r.iteration} jetée`;
+  return " ; plus rien ne couvre (aucune itération en cours)";
 }
 
 program
   .command("stop")
   .description("retire la plage manuelle (--auto : coupe les plages automatiques jusqu'à `resume`) ; le travail continue si l'autre source couvre encore")
   .option("--auto", "coupe les plages automatiques au lieu de la plage manuelle", false)
-  .option("--now", "si plus rien ne couvre, tue l'itération en cours au lieu d'attendre sa fin", false)
+  .option("--now", "si plus rien ne couvre, tue l'itération en cours (s'il y en a une) au lieu d'attendre sa fin", false)
   .action(async (opts: { auto: boolean; now: boolean }) => {
     const q = opts.now ? "?now=1" : "";
     if (opts.auto) {
@@ -109,7 +121,7 @@ program
   .description("rallume les plages automatiques coupées par `stop --auto` (refusé pendant une panne : `reset-error`)")
   .action(async () => {
     const r = await call<{ coveringUntil: string | null; nextStart: string | null }>(await sock(), "POST", "/auto");
-    const detail = r.coveringUntil ? `, plage en cours jusqu'à ${r.coveringUntil}` : r.nextStart ? `, prochaine le ${r.nextStart}` : "";
+    const detail = r.coveringUntil ? `, plage automatique en cours jusqu'à ${r.coveringUntil}` : r.nextStart ? `, prochaine le ${r.nextStart}` : "";
     console.log(`plages automatiques rallumées${detail}`);
   });
 
@@ -120,7 +132,7 @@ program
     const r = await call<{ manualDropped: string | null; coveringUntil: string | null; nextStart: string | null }>(await sock(), "DELETE", "/fatal");
     const manual = r.manualDropped ? ` ; plage manuelle retirée (courait jusqu'à ${r.manualDropped})` : "";
     const next = r.coveringUntil
-      ? ` ; plage automatique en cours jusqu'à ${r.coveringUntil}, le travail reprend`
+      ? ` ; plage automatique en cours jusqu'à ${r.coveringUntil}, le démon relance`
       : r.nextStart
         ? ` ; prochaine plage automatique le ${r.nextStart}`
         : " ; rien ne couvre : `start --for` pour relancer";
@@ -138,14 +150,16 @@ program
     if (s.fatal) console.log(`PANNE    ${s.fatal.reason} depuis ${s.fatal.at} : ${s.fatal.detail.split("\n")[0]}\n         plus rien ne tourne — répare, puis \`unused reset-error\` (ou redémarre le service)`);
     const w = s.window;
     if (!w) {
-      console.log("plage    aucune");
+      console.log("travail  aucun (rien ne tourne)");
     } else {
-      console.log(`plage    ${w.source}, jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
+      console.log(`travail  plage ${w.source}, jusqu'à ${w.until} (${formatDuration(w.remainingMs)} restantes)${w.stopping ? " — arrêt demandé" : ""}`);
       console.log(`         ${w.iterations} itérations, ${w.completed} completed, ${w.failures} échecs, ${w.backoffs} attentes quota, $${w.costUsd.toFixed(2)}`);
-      if (w.current) console.log(`en cours ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
-      else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil}`);
+      if (w.current) console.log(`en cours itération de ${w.current.task} / ${w.current.node} depuis ${w.current.at}`);
+      else if (w.waitingQuotaUntil) console.log(`en cours attente quota jusqu'à ${w.waitingQuotaUntil} (aucune itération)`);
+      else console.log("en cours entre deux itérations");
     }
-    if (s.manual) console.log(`manuelle jusqu'à ${s.manual.until}`);
+    if (s.manual) console.log(`manuelle plage jusqu'à ${s.manual.until}`);
+    else console.log("manuelle aucune plage");
     const a = s.auto;
     if (a.windows === 0) console.log("auto     aucune plage configurée");
     else if (!a.enabled) console.log(`auto     ${a.windows} plage(s), coupées (\`unused resume\`)`);

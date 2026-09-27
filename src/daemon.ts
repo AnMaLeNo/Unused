@@ -57,11 +57,15 @@ type WindowSource = NonNullable<DaemonStatus["window"]>["source"];
 export interface StopResult {
   // La plage retirée couvrait jusqu'à cet instant.
   until: string | null;
-  // L'autre source couvre encore : le travail continue jusque-là.
+  // L'autre source couvre encore jusque-là.
   continuing: string | null;
+  // Tâche dont une itération tournait à l'instant du stop.
+  iteration: string | null;
+  // Le démon était en veille (plus rien à faire) : la couverture court mais rien ne tourne.
+  idle: boolean;
   // Plus rien ne couvre : arrêt tout de suite (`now`, ou rien ne tournait) ou après l'itération en cours.
   stopping: "now" | "after-iteration" | null;
-  // Une itération a été tuée.
+  // L'itération en cours a été tuée.
   killed: boolean;
 }
 
@@ -167,6 +171,10 @@ export class Daemon {
   /** Boucle principale : travaille quand une plage le dit, attend sinon. Sort quand `signal` est levé. */
   async run(signal: AbortSignal): Promise<void> {
     const onAbort = (): void => {
+      const cur = this.running?.current;
+      if (cur) this.deps.print(`itération de ${cur.task} jetée`);
+      const manual = this.manualUntil(this.deps.now());
+      if (manual) this.deps.print(`plage manuelle jusqu'à ${manual.toISOString()} : reprise au prochain démarrage`);
       this.running?.ac.abort();
       this.wake?.();
     };
@@ -373,10 +381,18 @@ export class Daemon {
   private afterRemoval(until: Date | null, now: boolean): StopResult {
     const deadline = this.deadline();
     const continuing = deadline.getTime() > this.deps.now().getTime() ? deadline : null;
+    const idle = this.sleeping(this.deps.now());
     // La veille ne doit pas dépasser la couverture restante.
     if (this.idleUntil && this.idleUntil.getTime() > deadline.getTime()) this.idleUntil = deadline;
     const run = this.running;
-    const r: StopResult = { until: until?.toISOString() ?? null, continuing: continuing?.toISOString() ?? null, stopping: null, killed: false };
+    const r: StopResult = {
+      until: until?.toISOString() ?? null,
+      continuing: continuing?.toISOString() ?? null,
+      iteration: run?.current?.task ?? null,
+      idle,
+      stopping: null,
+      killed: false,
+    };
     if (continuing) {
       // La fin de plage est réévaluée à chaque tour par le scheduler : rien à faire.
       this.wake?.();
@@ -481,8 +497,4 @@ export class Daemon {
     if (active) this.wakeUp();
   }
 
-  describeWindow(): string {
-    if (!this.running) return "aucune plage en cours";
-    return `plage en cours, ${formatDuration(this.deadline().getTime() - this.deps.now().getTime())} restantes`;
-  }
 }

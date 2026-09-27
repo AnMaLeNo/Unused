@@ -24,6 +24,7 @@ let seen: { until: Date; deps: Partial<SchedulerDeps> }[] = [];
 const fakeRunWindow: typeof runWindow = async (_cfg, _tasks, _state, deadline, signal, deps = {}) => {
   const until = typeof deadline === "function" ? deadline() : deadline;
   seen.push({ until, deps });
+  deps.onEvent?.({ type: "iteration-start", task: "t1", node: "a", at: new Date().toISOString() });
   await new Promise<void>((resolve) => {
     finish = resolve;
     signal.addEventListener("abort", () => resolve());
@@ -52,9 +53,9 @@ function coveringWindow(hours: number): { spec: WindowSpec; end: Date } {
 const near = (iso: string | null | undefined, d: Date) => Math.abs(new Date(iso ?? 0).getTime() - d.getTime()) < 60_000;
 const savedState = async () => JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")) as RunnerState;
 
-async function boot(initial?: RunnerState): Promise<void> {
+async function boot(initial?: RunnerState, print: (line: string) => void = () => {}): Promise<void> {
   if (initial) await saveState(cfg.dataDir, initial);
-  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x" });
+  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x", print });
   await daemon.init();
   server = createApi(cfg, daemon);
   await listen(server, sock);
@@ -113,7 +114,7 @@ describe("daemon + api", () => {
     await expect(call(sock, "POST", "/window", { for: "1h" })).rejects.toMatchObject({ status: 409 } satisfies Partial<ApiError>);
 
     const st = await call<StopResult>(sock, "DELETE", "/window");
-    expect(st).toMatchObject({ until: r.until, continuing: null, stopping: "after-iteration" });
+    expect(st).toMatchObject({ until: r.until, continuing: null, iteration: "t1", idle: false, stopping: "after-iteration", killed: false });
     await tick();
     expect((await status()).window).toBeNull();
     expect((await status()).manual).toBeNull();
@@ -126,7 +127,7 @@ describe("daemon + api", () => {
     await boot();
     await call(sock, "POST", "/window", { for: "1h" });
     await tick();
-    expect((await call<StopResult>(sock, "DELETE", "/window?now=1")).stopping).toBe("now");
+    expect(await call<StopResult>(sock, "DELETE", "/window?now=1")).toMatchObject({ iteration: "t1", stopping: "now", killed: true });
     await tick();
     expect((await status()).window).toBeNull();
     expect((await savedState()).window).toBeNull();
@@ -134,10 +135,12 @@ describe("daemon + api", () => {
   });
 
   it("arrêt du service (SIGTERM) : la plage reste enregistrée et est reprise au démarrage suivant", async () => {
-    await boot();
+    const lines: string[] = [];
+    await boot(undefined, (l) => lines.push(l));
     await call(sock, "POST", "/window", { for: "1h" });
     await tick();
     await shutdown();
+    expect(lines.filter((l) => /jetée|reprise au prochain/.test(l))).toEqual(["itération de t1 jetée", expect.stringMatching(/^plage manuelle jusqu'à .* : reprise au prochain démarrage$/)]);
     const saved = JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")) as RunnerState;
     expect(saved.window).not.toBeNull();
 
@@ -243,7 +246,7 @@ describe("daemon + api", () => {
     expect(seen).toHaveLength(1);
 
     const st = await call<StopResult>(sock, "DELETE", "/window?now=1");
-    expect(st).toMatchObject({ until: r.until, stopping: null, killed: false });
+    expect(st).toMatchObject({ until: r.until, iteration: "t1", idle: false, stopping: null, killed: false });
     expect(near(st.continuing, end)).toBe(true);
     await tick();
     const s2 = await status();
@@ -283,7 +286,7 @@ describe("daemon + api", () => {
   it("stop --auto au repos : rien ne tourne, le calendrier ne réveillera pas ; stop manuel au repos → 409", async () => {
     await boot();
     const st = await call<StopResult>(sock, "DELETE", "/auto");
-    expect(st).toMatchObject({ until: null, continuing: null, stopping: "now", killed: false });
+    expect(st).toMatchObject({ until: null, continuing: null, iteration: null, idle: false, stopping: "now", killed: false });
     expect((await status()).auto.enabled).toBe(false);
     await expect(call(sock, "DELETE", "/window")).rejects.toMatchObject({ status: 409, message: /aucune plage manuelle/ });
     await shutdown();
@@ -312,7 +315,8 @@ describe("daemon + api", () => {
     await tick();
     expect(calls).toBe(2);
     // Retirer la plage manuelle raccourcit la veille à ce qui couvre encore : ici, rien.
-    await call(sock, "DELETE", "/window");
+    const st = await call<StopResult>(sock, "DELETE", "/window");
+    expect(st).toMatchObject({ continuing: null, iteration: null, idle: true, stopping: "now", killed: false });
     await tick();
     expect((await status()).idleUntil).toBeNull();
     expect(calls).toBe(2);
