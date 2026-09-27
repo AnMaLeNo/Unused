@@ -2,8 +2,8 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { coverageEnd, nextStart } from "./calendar.js";
 import type { Config } from "./config.js";
-import { formatDuration } from "./duration.js";
 import { dockerVersion, imageExists, removeTaskImages } from "./docker.js";
+import { pickNext } from "./graph.js";
 import { DONE_FILE, TOKEN_ENV } from "./iterate.js";
 import { runWindow, type SchedulerEvent, type WindowSummary } from "./scheduler.js";
 import { ensureTaskState, loadState, saveState, type RunnerState, type TaskState } from "./state.js";
@@ -32,8 +32,8 @@ export interface DaemonStatus {
   manual: null | { until: string };
   // Plages automatiques : `stop --auto` / `resume`. `coveringUntil` : fin de la plage du calendrier en cours, s'il y en a une.
   auto: { enabled: boolean; windows: number; coveringUntil: string | null; nextStart: string | null };
-  // Veille : plus rien à faire (ou erreur), on ne relance pas avant cet instant.
-  idleUntil: string | null;
+  // Une plage couvre mais aucune tâche n'est à faire : rien ne tourne, les tâches sont relues régulièrement.
+  idle: boolean;
   // Panne globale : plus rien ne tourne tant qu'un `reset-error` ne l'efface pas (ou un redémarrage du service).
   fatal: null | { reason: "auth" | "docker"; detail: string; at: string };
   lastWindow: WindowSummary | null;
@@ -61,7 +61,7 @@ export interface StopResult {
   continuing: string | null;
   // Tâche dont une itération tournait à l'instant du stop.
   iteration: string | null;
-  // Le démon était en veille (plus rien à faire) : la couverture court mais rien ne tourne.
+  // Une plage couvre mais aucune tâche n'était à faire : rien ne tournait.
   idle: boolean;
   // Plus rien ne couvre : arrêt tout de suite (`now`, ou rien ne tournait) ou après l'itération en cours.
   stopping: "now" | "after-iteration" | null;
@@ -78,12 +78,17 @@ interface Running {
   waitingQuotaUntil: Date | null;
 }
 
+// Pendant une plage sans tâche à faire, les tâches sont relues à ce rythme.
+const TASK_POLL_MS = 30_000;
+
 export interface DaemonDeps {
   runWindow: typeof runWindow;
   imageExists: typeof imageExists;
   removeTaskImages: typeof removeTaskImages;
   dockerVersion: typeof dockerVersion;
   env: Record<string, string | undefined>;
+  // Pendant une plage sans tâche à faire (ou après une erreur), délai avant de relire les tâches.
+  taskPollMs: number;
   now: () => Date;
   print: (line: string) => void;
 }
@@ -98,8 +103,8 @@ export class Daemon {
   private state!: RunnerState;
   // Plage manuelle posée ; `resumed` : retrouvée dans state.json au démarrage.
   private manual: { until: Date; resumed: boolean } | null = null;
-  // Plus rien à faire (ou erreur) : on ne relance pas avant cet instant. Levé par start, resume, reset-error, tasks reset/activate.
-  private idleUntil: Date | null = null;
+  // Une plage couvre mais aucune tâche n'est à faire.
+  private nothingToDo = false;
   private running: Running | null = null;
   private lastWindow: WindowSummary | null = null;
   private fatal: DaemonStatus["fatal"] = null;
@@ -111,7 +116,7 @@ export class Daemon {
     private readonly cfg: Config,
     deps: Partial<DaemonDeps> = {},
   ) {
-    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, now: () => new Date(), print: () => {}, ...deps };
+    this.deps = { runWindow, imageExists, removeTaskImages, dockerVersion, env: process.env, taskPollMs: TASK_POLL_MS, now: () => new Date(), print: () => {}, ...deps };
     this.startedAt = this.deps.now();
   }
 
@@ -158,10 +163,6 @@ export class Daemon {
     return nextStart(this.cfg.windows, this.deps.now());
   }
 
-  private sleeping(now: Date): boolean {
-    return this.idleUntil !== null && this.idleUntil.getTime() > now.getTime();
-  }
-
   private async setManual(manual: { until: Date; resumed: boolean } | null): Promise<void> {
     this.manual = manual;
     this.state.window = manual ? { startedAt: this.deps.now().toISOString(), until: manual.until.toISOString() } : null;
@@ -183,23 +184,48 @@ export class Daemon {
       while (!signal.aborted) {
         const now = this.deps.now();
         if (this.manual && this.manualUntil(now) === null) await this.setManual(null);
-        if (this.deadline().getTime() > now.getTime() && !this.sleeping(now)) {
-          await this.execute();
+        if (this.deadline().getTime() > now.getTime()) {
+          // Une plage couvre : s'il y a une tâche à faire, on la fait ; sinon on relit
+          // les tâches un peu plus tard (une tâche ajoutée à la main est vue ainsi).
+          if (await this.hasWork()) {
+            this.setNothingToDo(false);
+            if (await this.execute()) continue;
+          } else this.setNothingToDo(true);
+          await this.idle(signal, this.deps.taskPollMs);
           continue;
         }
-        await this.idle(signal);
+        this.setNothingToDo(false);
+        await this.idle(signal, null);
       }
     } finally {
       signal.removeEventListener("abort", onAbort);
     }
   }
 
-  /** Attend un réveil de l'API, la fin de la veille ou la prochaine plage automatique. */
-  private idle(signal: AbortSignal): Promise<void> {
+  /** Au moins une tâche à faire ? Relu sur disque à chaque fois. Une erreur de lecture sera dite par la plage. */
+  private async hasWork(): Promise<boolean> {
+    try {
+      const { tasks } = await loadTasks(this.cfg.tasksDir);
+      return pickNext(tasks, this.state) !== null;
+    } catch {
+      return true;
+    }
+  }
+
+  private setNothingToDo(value: boolean): void {
+    if (value && !this.nothingToDo) {
+      this.deps.print(`aucune tâche à faire : rien ne tourne, tâches relues toutes les ${Math.round(this.deps.taskPollMs / 1000)} s`);
+    }
+    this.nothingToDo = value;
+  }
+
+  /** Attend un réveil de l'API, la prochaine plage automatique, ou au plus `maxMs`. */
+  private idle(signal: AbortSignal, maxMs: number | null): Promise<void> {
     return new Promise<void>((resolve) => {
       const now = this.deps.now();
-      const next = this.sleeping(now) ? this.idleUntil : this.nextCalendarStart();
-      const ms = next ? Math.max(0, next.getTime() - now.getTime()) : null;
+      const next = this.nextCalendarStart();
+      const untilNext = next ? Math.max(0, next.getTime() - now.getTime()) : null;
+      const ms = maxMs === null ? untilNext : untilNext === null ? maxMs : Math.min(untilNext, maxMs);
       const timer = ms !== null ? setTimeout(done, Math.min(ms, 2_147_000_000)) : null;
       function done(): void {
         if (timer) clearTimeout(timer);
@@ -212,7 +238,8 @@ export class Daemon {
     });
   }
 
-  private async execute(): Promise<void> {
+  /** Fait tourner une plage ; false si elle a été interrompue par une erreur. */
+  private async execute(): Promise<boolean> {
     const run: Running = {
       startedAt: this.deps.now(),
       ac: new AbortController(),
@@ -242,27 +269,17 @@ export class Daemon {
       if (this.lastWindow.fatal) {
         this.fatal = { ...this.lastWindow.fatal, at: this.deps.now().toISOString() };
         this.deps.print(`PANNE ${this.fatal.reason} : ${this.fatal.detail.split("\n")[0]} — plus rien ne tourne jusqu'à un \`unused reset-error\` (ou un redémarrage du service) une fois réparé`);
-      } else if (this.lastWindow.endedBecause === "nothing-eligible") {
-        this.sleep("plus rien à faire");
       }
+      return true;
     } catch (err) {
       this.deps.print(`plage interrompue par une erreur : ${(err as Error).message}`);
-      this.sleep("erreur");
+      return false;
     } finally {
       this.running = null;
     }
   }
 
-  /** Inutile de relancer tant que la couverture actuelle dure ; start, resume, reset-error, tasks reset/activate réveillent. */
-  private sleep(why: string): void {
-    const until = this.deadline();
-    if (until.getTime() <= this.deps.now().getTime()) return;
-    this.idleUntil = until;
-    this.deps.print(`veille jusqu'à ${until.toISOString()} (${why})`);
-  }
-
   private wakeUp(): void {
-    this.idleUntil = null;
     this.wake?.();
   }
 
@@ -381,9 +398,7 @@ export class Daemon {
   private afterRemoval(until: Date | null, now: boolean): StopResult {
     const deadline = this.deadline();
     const continuing = deadline.getTime() > this.deps.now().getTime() ? deadline : null;
-    const idle = this.sleeping(this.deps.now());
-    // La veille ne doit pas dépasser la couverture restante.
-    if (this.idleUntil && this.idleUntil.getTime() > deadline.getTime()) this.idleUntil = deadline;
+    const idle = this.nothingToDo;
     const run = this.running;
     const r: StopResult = {
       until: until?.toISOString() ?? null,
@@ -444,7 +459,7 @@ export class Daemon {
         coveringUntil: this.calendarEnd(now)?.toISOString() ?? null,
         nextStart: this.nextCalendarStart()?.toISOString() ?? null,
       },
-      idleUntil: this.sleeping(now) ? this.idleUntil!.toISOString() : null,
+      idle: this.nothingToDo,
       fatal: this.fatal,
       lastWindow: this.lastWindow,
       tasks: tasks.map((t) => this.taskInfo(t)),

@@ -100,9 +100,10 @@ n'arrête rien si l'autre couvre encore : avec une plage automatique de 1 h à
 mais le travail continue jusqu'à 3 h ; un `stop --auto` à 2 h 30 continue
 jusqu'à 4 h. La CLI le dit à chaque fois.
 
-Quand plus aucune tâche n'est éligible, le démon se met en veille jusqu'à la
-fin de la couverture en cours ; `tasks reset`, `tasks activate`, `start` ou
-`resume` le réveillent.
+Pendant une plage, le démon travaille dès qu'une tâche est à faire. Quand il
+n'y en a aucune, il relit les tâches toutes les 30 s (tout de suite après
+`tasks reset` ou `tasks activate`) : une tâche ajoutée ou réactivée est prise
+sans rien relancer.
 
 ## Quota
 

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApi, listen, socketPath } from "./api.js";
 import { ApiError, call } from "./client.js";
 import type { Config } from "./config.js";
-import { Daemon, type DaemonStatus, type StopResult } from "./daemon.js";
+import { Daemon, type DaemonDeps, type DaemonStatus, type StopResult } from "./daemon.js";
 import type { runWindow, SchedulerDeps, WindowSummary } from "./scheduler.js";
 import { emptyState, saveState, type RunnerState } from "./state.js";
 import type { WindowSpec } from "./calendar.js";
@@ -53,9 +53,9 @@ function coveringWindow(hours: number): { spec: WindowSpec; end: Date } {
 const near = (iso: string | null | undefined, d: Date) => Math.abs(new Date(iso ?? 0).getTime() - d.getTime()) < 60_000;
 const savedState = async () => JSON.parse(await readFile(path.join(cfg.dataDir, "state.json"), "utf8")) as RunnerState;
 
-async function boot(initial?: RunnerState, print: (line: string) => void = () => {}): Promise<void> {
+async function boot(initial?: RunnerState, print: (line: string) => void = () => {}, deps: Partial<DaemonDeps> = {}): Promise<void> {
   if (initial) await saveState(cfg.dataDir, initial);
-  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x", print });
+  daemon = new Daemon(cfg, { runWindow: fakeRunWindow, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x", print, ...deps });
   await daemon.init();
   server = createApi(cfg, daemon);
   await listen(server, sock);
@@ -292,34 +292,47 @@ describe("daemon + api", () => {
     await shutdown();
   });
 
-  it("sans rien à faire : veille jusqu'à la fin de la couverture, la plage manuelle reste posée, un reset réveille", async () => {
-    let calls = 0;
-    const idleRun: typeof runWindow = async () => {
-      calls += 1;
-      return { iterations: 0, completed: 0, failures: 0, backoffs: 0, costUsd: 0, endedBecause: "nothing-eligible" };
-    };
-    daemon = new Daemon(cfg, { runWindow: idleRun, imageExists: async () => true, removeTaskImages: async () => {}, dockerVersion: async () => "x" });
-    await daemon.init();
-    server = createApi(cfg, daemon);
-    await listen(server, sock);
-    ac = new AbortController();
-    loop = daemon.run(ac.signal);
+  /** Passe `active` de t1 directement dans son task.json, sans passer par le démon. */
+  async function setActiveByHand(active: boolean): Promise<void> {
+    const file = path.join(cfg.tasksDir, "t1", "task.json");
+    const def = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+    await writeFile(file, JSON.stringify({ ...def, active }));
+  }
+
+  async function until(cond: () => boolean | Promise<boolean>): Promise<void> {
+    for (let i = 0; i < 100 && !(await cond()); i++) await tick();
+  }
+
+  it("plage sans tâche à faire : rien ne tourne ; une tâche réactivée à la main est prise pendant la plage", async () => {
+    await setActiveByHand(false);
+    await boot(undefined, undefined, { taskPollMs: 10 });
     const r = await call<{ until: string }>(sock, "POST", "/window", { for: "1h" });
     await tick();
-    expect(calls).toBe(1);
     const s = await status();
+    expect(seen).toHaveLength(0);
     expect(s.window).toBeNull();
-    expect(s.idleUntil).toBe(r.until);
+    expect(s.idle).toBe(true);
     expect(s.manual?.until).toBe(r.until);
-    await call(sock, "POST", "/tasks/t1/reset");
-    await tick();
-    expect(calls).toBe(2);
-    // Retirer la plage manuelle raccourcit la veille à ce qui couvre encore : ici, rien.
+
+    await setActiveByHand(true);
+    await until(() => seen.length > 0);
+    expect(seen).toHaveLength(1);
+    const s2 = await status();
+    expect(s2.idle).toBe(false);
+    expect(s2.window?.source).toBe("manual");
+    await shutdown();
+  });
+
+  it("stop pendant une plage sans tâche à faire : rien ne tournait, plus rien ne couvre", async () => {
+    await setActiveByHand(false);
+    await boot(undefined, undefined, { taskPollMs: 10 });
+    await call(sock, "POST", "/window", { for: "1h" });
+    await until(async () => (await status()).idle);
     const st = await call<StopResult>(sock, "DELETE", "/window");
     expect(st).toMatchObject({ continuing: null, iteration: null, idle: true, stopping: "now", killed: false });
     await tick();
-    expect((await status()).idleUntil).toBeNull();
-    expect(calls).toBe(2);
+    expect((await status()).idle).toBe(false);
+    expect(seen).toHaveLength(0);
     await shutdown();
   });
 

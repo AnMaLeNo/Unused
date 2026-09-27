@@ -87,7 +87,7 @@ function stopOutcome(r: StopResult, other: string): string {
     const doing = r.iteration
       ? `le travail continue (itération de ${r.iteration} en cours)`
       : r.idle
-        ? "mais le démon est en veille (plus rien à faire)"
+        ? "mais aucune tâche à faire pour l'instant"
         : "le démon reste en plage";
     return ` ; ${other} couvre jusqu'à ${r.continuing}, ${doing}`;
   }
@@ -164,7 +164,7 @@ program
     if (a.windows === 0) console.log("auto     aucune plage configurée");
     else if (!a.enabled) console.log(`auto     ${a.windows} plage(s), coupées (\`unused resume\`)`);
     else console.log(`auto     ${a.windows} plage(s)${a.coveringUntil ? `, en cours jusqu'à ${a.coveringUntil}` : ""}${a.nextStart ? `, prochaine le ${a.nextStart}` : ""}`);
-    if (s.idleUntil) console.log(`veille   jusqu'à ${s.idleUntil} (plus rien à faire — tasks reset/activate, start ou resume réveillent)`);
+    if (s.idle) console.log("attente  aucune tâche à faire : le travail reprend dès qu'une tâche est ajoutée ou réactivée");
     if (s.lastWindow && !w) {
       const l = s.lastWindow;
       console.log(`dernière ${l.iterations} itérations, ${l.completed} completed, ${l.failures} échecs, $${l.costUsd.toFixed(2)} (${l.endedBecause})`);
