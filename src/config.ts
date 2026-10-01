@@ -32,7 +32,7 @@ const ConfigFileSchema = z
     windows: z.array(WindowSpecSchema).default([]),
     scheduler: z
       .object({
-        // Attente globale après un `blocking_limit` (quota saturé).
+        // Attente globale sur quota saturé quand l'heure du reset n'est pas connue.
         backoffMinutes: z.number().int().positive().default(15),
         // Pause après un échec (hors quota) avant de rejouer le même nœud.
         retrySeconds: z.number().nonnegative().default(60),
