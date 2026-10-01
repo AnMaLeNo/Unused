@@ -160,6 +160,8 @@ export function probe(sock: string): Promise<boolean> {
 
 /** Écoute sur le socket, après avoir écarté un socket périmé (ou refusé si un démon répond). Crée le dossier du socket au besoin. */
 export async function listen(server: http.Server, sock: string): Promise<void> {
+  // Sur une installation neuve, data/ n'existe pas encore (il n'est pas versionné).
+  await mkdir(path.dirname(sock), { recursive: true });
   if (await probe(sock)) throw new Error(`un démon répond déjà sur ${sock}`);
   await mkdir(path.dirname(sock), { recursive: true });
   await unlink(sock).catch(() => {});
