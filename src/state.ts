@@ -74,11 +74,22 @@ export async function loadState(dataDir: string): Promise<RunnerState> {
   return parsed.data;
 }
 
+// Les sauvegardes passent une à une : deux écritures simultanées (une commande
+// de l'API pendant la fin d'une itération) partageaient le fichier temporaire.
+let queue: Promise<void> = Promise.resolve();
+
 /** Écriture atomique : fichier temporaire puis rename, pour survivre à une coupure. */
-export async function saveState(dataDir: string, state: RunnerState): Promise<void> {
+export function saveState(dataDir: string, state: RunnerState): Promise<void> {
+  const run = queue.then(() => writeState(dataDir, state));
+  queue = run.catch(() => {});
+  return run;
+}
+
+async function writeState(dataDir: string, state: RunnerState): Promise<void> {
   await mkdir(dataDir, { recursive: true });
   const file = path.join(dataDir, STATE_FILE);
-  const tmp = `${file}.tmp`;
+  // Propre au processus : un second démon lancé par erreur n'écrit pas dans le même.
+  const tmp = `${file}.${process.pid}.tmp`;
   await writeFile(tmp, JSON.stringify(state, null, 2) + "\n", "utf8");
   await rename(tmp, file);
 }
