@@ -131,6 +131,8 @@ export class Daemon {
   // Erreurs inattendues d'affilée ; remis à zéro par une plage qui se termine sans erreur.
   private retry: { attempts: number; error: string; nextAt: Date } | null = null;
   private wake: (() => void) | null = null;
+  // Tâches illisibles au dernier chargement (task.json cassé, skill absent…).
+  private loadErrors = 0;
   private readonly startedAt: Date;
   private readonly deps: DaemonDeps;
 
@@ -357,6 +359,7 @@ export class Daemon {
           now: this.deps.now,
           shouldStop: () => run.stopRequested,
           onEvent: (e) => this.onEvent(run, e),
+          tasksUnreadable: () => this.loadErrors > 0,
         },
       );
       if (this.lastWindow.fatal) {
@@ -410,6 +413,7 @@ export class Daemon {
 
   private async loadTasks(): Promise<Task[]> {
     const { tasks, errors } = await loadTasks(this.cfg.tasksDir);
+    this.loadErrors = errors.length;
     for (const e of errors) this.deps.print(`tâche ${e.name} ignorée : ${e.message}`);
     return tasks;
   }
